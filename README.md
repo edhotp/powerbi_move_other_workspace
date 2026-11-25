@@ -11,6 +11,68 @@ Script [Migrate-PowerBIReports.ps1](Migrate-PowerBIReports.ps1) memakai **Power 
 
 Keduanya hanya **preview** tanpa `-Apply`. Move adalah **clone + delete**, bukan perpindahan atomik yang mempertahankan ID. Jika terjadi kegagalan, sebagian salinan/penghapusan bisa sudah selesai dan dicatat di state.
 
+## Diagram alur aktivitas
+
+Alur berikut mengikuti [Migrate-PowerBIReports.ps1](Migrate-PowerBIReports.ps1), termasuk penggunaan state saat proses dijalankan ulang.
+
+```mermaid
+flowchart TD
+    START([Mulai]) --> INPUT["Baca workspace asal/tujuan, ReportIds, Mode dan Apply"]
+    INPUT --> INIT["Siapkan StatePath<br/>Ambil lock jika Apply aktif"]
+    INIT --> LOGIN["Cek modul autentikasi<br/>Login pengguna interaktif ke Power BI"]
+    LOGIN --> WORKSPACES["GET daftar workspace dan resolve nama atau ID"]
+    WORKSPACES --> CAPACITY{"Workspace berbeda, akses tulis,<br/>dedicated capacity dan capacityId sama?"}
+    CAPACITY -->|Tidak| STOP["Berhenti dengan error<br/>Tinjau hasil dan state sebelum melanjutkan"]
+    CAPACITY -->|Ya| STATE["Baca dan validasi state<br/>GET daftar report asal dan tujuan"]
+    STATE --> SELECT["Pilih semua report atau ReportIds<br/>Sertakan resume Move yang sumbernya sudah hilang"]
+    SELECT --> PREFLIGHT{"Jenis report, nama, binding<br/>dan state valid tanpa konflik?"}
+    PREFLIGHT -->|Tidak| STOP
+    PREFLIGHT -->|Ya| PLAN["Tampilkan rencana dan peringatan<br/>Semantic model tetap di lokasi asal"]
+    PLAN --> APPLY{"Apply aktif?"}
+    APPLY -->|Tidak| PREVIEW["Preview saja<br/>Tidak membuat atau menghapus report"]
+    PREVIEW --> CLEANUP["Lepaskan lock jika diambil"]
+    APPLY -->|Ya| TARGET["Proses report tujuan berikutnya"]
+    TARGET --> CLONE{"Perlu clone baru?"}
+    CLONE -->|Ya| REQUEST["Simpan status CloneRequested"]
+    REQUEST --> POST["POST Clone ke workspace tujuan<br/>Jangan ulang POST otomatis"]
+    POST --> CREATED["Simpan targetReportId<br/>dan status Created"]
+    CLONE -->|Tidak, sudah tercatat| VERIFY
+    CREATED --> VERIFY["GET report tujuan<br/>Periksa ID, nama dan datasetId"]
+    VERIFY --> VALID{"Identitas dan binding cocok?"}
+    VALID -->|Tidak| STOP
+    VALID -->|Ya| SAVETARGET["Simpan hasil verifikasi tujuan<br/>Pertahankan status penghapusan saat resume"]
+    SAVETARGET --> MORETARGET{"Masih ada report tujuan?"}
+    MORETARGET -->|Ya| TARGET
+    MORETARGET -->|Tidak| MODE{"Mode Move?"}
+    MODE -->|Tidak, Copy| COPYDONE["Copy selesai<br/>Semua report asal tetap ada"]
+    COPYDONE --> CLEANUP
+    MODE -->|Ya| RECHECK["GET ulang semua report asal yang masih ada<br/>Periksa ID, nama dan datasetId sebelum DELETE pertama"]
+    RECHECK --> SOURCEVALID{"Semua sumber yang diperiksa cocok?"}
+    SOURCEVALID -->|Tidak| STOP
+    SOURCEVALID -->|Ya| SOURCE["Proses report asal berikutnya"]
+    SOURCE --> DELETED{"State sudah SourceDeleted?"}
+    DELETED -->|Ya| CONFIRM
+    DELETED -->|Tidak| DELETESTATE["Simpan status DeleteRequested"]
+    DELETESTATE --> PRESENT{"Sumber masih ada dalam rencana?"}
+    PRESENT -->|Ya| DELETE["DELETE report asal<br/>Jangan ulang DELETE otomatis"]
+    PRESENT -->|Tidak, resume| CONFIRM
+    DELETE --> CONFIRM["GET report asal untuk memastikan penghapusan"]
+    CONFIRM --> ABSENT{"HTTP 404?"}
+    ABSENT -->|Tidak, masih ada atau error lain| STOP
+    ABSENT -->|Ya| SAVEDELETE["Simpan status SourceDeleted"]
+    SAVEDELETE --> MORESOURCE{"Masih ada report asal dalam rencana?"}
+    MORESOURCE -->|Ya| SOURCE
+    MORESOURCE -->|Tidak| MOVEDONE["Move selesai<br/>Report asal terhapus, model tetap di lokasi asal"]
+    MOVEDONE --> CLEANUP
+    STOP --> CLEANUP
+    CLEANUP --> END([Akhir proses])
+```
+
+- Kegagalan login, request API, atau penulisan state pada aktivitas mana pun menghentikan proses dan tetap melepaskan lock. GET tertentu dapat diulang sesuai aturan retry; POST/DELETE tidak diulang otomatis.
+- State `CloneRequested` yang belum pasti menghentikan preflight, bukan menyebabkan clone ulang. Report tujuan yang sudah tercatat diverifikasi kembali.
+- **Semua tujuan harus lolos verifikasi API sebelum penghapusan pertama.** Pada resume Move, sumber yang sudah hilang dikonfirmasi melalui GET tanpa DELETE ulang.
+- Penghapusan Move dilakukan satu per satu, bukan satu transaksi. `Verified` bukan bukti visual/data/RLS benar; gunakan Copy dahulu untuk uji pengguna sebelum Move.
+
 ## Yang dipindahkan dan yang tidak
 
 - Report dibuat sebagai **salinan baru** di workspace tujuan, dengan nama yang sama tetapi ID dan URL baru.

@@ -2,3 +2,8 @@ migration-state.json
 migration-state.json.*
 migration-*.json
 migration-*.json.*
+Backups/
+*.pbix
+*.pbix.partial
+backup-manifest.json
+backup-manifest.json.tmp

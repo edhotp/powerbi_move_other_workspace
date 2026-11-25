@@ -1,0 +1,4 @@
+migration-state.json
+migration-state.json.*
+migration-*.json
+migration-*.json.*

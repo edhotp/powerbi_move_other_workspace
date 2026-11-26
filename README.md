@@ -210,9 +210,10 @@ pwsh -NoProfile -File .\Tests\Migrate-PowerBIReports.Tests.ps1
 ```
 
 - **147 unit test** lulus: backup, Copy/Move, model, retry/resume, penolakan konfirmasi, host noninteraktif, WhatIf dan perubahan setelah persetujuan.
-- Tes API nyata 25-26 November 2026 memakai sample resmi [Retail Analysis](https://learn.microsoft.com/en-us/power-bi/create-reports/sample-retail-analysis) di workspace uji pada capacity yang sama. Backup, Copy report/model, pengulangan tanpa duplikat, serta restore PBIX ke model terpisah berhasil; 4 halaman cocok.
-- **Move report-only berhasil; Move dengan model terblokir** oleh `ModelRefreshFailed_CredentialsNotSpecified` pada SQL sample. Report/model source dipertahankan. Ini bukan bukti Move dengan model sudah lulus penuh.
-- Tes API memakai autentikasi harness dari sesi delegasi pengguna Azure karena unduhan modul Power BI gagal. **Login interaktif modul, visual/RLS, pembukaan PBIX di Desktop dan konfirmasi wajib terbaru belum diverifikasi melalui tes tenant langsung.** Jangan menganggap unit test atau sample sebagai penerimaan produksi.
+- Tes API nyata 25-26 November 2026 memakai sample resmi [Retail Analysis](https://learn.microsoft.com/en-us/power-bi/create-reports/sample-retail-analysis) di workspace uji pada capacity yang sama. Backup, Copy report/model dan pengulangan tanpa duplikat berhasil; 4 halaman cocok. Restore PBIX ke model terpisah juga berhasil pada tes sebelumnya.
+- Versi dengan konfirmasi wajib telah diuji langsung: preview/WhatIf tanpa perubahan, Copy report + model, Copy ulang, serta **Move report-only dan resume** berhasil. Catatan persetujuan membuktikan satu DELETE disetujui untuk sample terpisah; resume hanya memverifikasi HTTP 404 tanpa persetujuan DELETE baru.
+- **Move dengan model tetap terblokir** oleh `ModelRefreshFailed_CredentialsNotSpecified` pada SQL sample; report/model source dipertahankan. Respons refresh tanpa ID pelacakan dihentikan dengan aman. ID operasi tes dikorelasikan secara unik dari riwayat layanan untuk memantau kegagalan yang sama, bukan mengirim POST refresh baru. Ini bukan bukti Move dengan model sudah lulus penuh.
+- Tes API memakai autentikasi harness dari sesi delegasi pengguna Azure karena unduhan modul Power BI gagal. **Atas izin pengguna, input konfirmasi otomatis hanya pada harness yang dibatasi ke ID workspace/sample uji**; script utama tidak diberi opsi bypass. Ini menguji alur dan pengaman dengan input tes, bukan penerimaan manusia untuk produksi. Login interaktif modul, UI input konsol manual, visual/RLS dan pembukaan PBIX di Desktop belum diverifikasi langsung.
 
 ## Disclaimer
 

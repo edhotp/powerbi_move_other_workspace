@@ -10,6 +10,8 @@ IncludeSemanticModels imports related models into the target and keeps their
 original data source references. Move then requires target source validation.
 All selected reports must have verified local PBIX backups before mutation.
 Uses interactive user login through MicrosoftPowerBIMgmt.Profile 1.3.84+.
+Every logical activity requires explicit confirmation. Move additionally
+requires cutover acceptance and typed approval for each source report.
 #>
 [CmdletBinding()]
 param(
@@ -28,6 +30,8 @@ param(
 
     [switch]$Apply,
 
+    [switch]$WhatIf,
+
     [switch]$IncludeSemanticModels,
 
     [ValidateNotNullOrEmpty()]
@@ -42,6 +46,19 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $apiRoot = 'https://api.powerbi.com/v1.0/myorg'
+
+function Request-ActivityConfirmation {
+    param(
+        [string]$Activity,
+        [string]$Details,
+        [string]$RequiredText = 'LANJUT'
+    )
+    Write-Host "`n[$Activity] $Details"
+    $answer = Read-Host "[$Activity] Ketik tepat '$RequiredText' untuk menyetujui; Enter/jawaban lain membatalkan"
+    if ($answer -cne $RequiredText) {
+        throw [OperationCanceledException]::new("Dibatalkan pada aktivitas '$Activity'. Aktivitas tersebut tidak dijalankan; hasil tahap sebelumnya tetap tersimpan. Gunakan state yang sama setelah ditinjau.")
+    }
+}
 
 function Get-PowerBIHeaders {
     $headers = Get-PowerBIAccessToken -ErrorAction Stop
@@ -347,6 +364,9 @@ function Complete-ModelImport {
     $model = $state['models'][$ModelId]
     if ($model['status'] -eq 'Planned') {
         $backup = $state['backups'][$BackupReportId]
+        Request-ActivityConfirmation -Activity 'ImportModel' -Details "Import model '$($model['name'])' [$ModelId] dari backup '$($backup['path'])' ke '$($target['name'])' [$($target['id'])]. Tidak menimpa model yang sudah ada."
+        $backupItem = @($plan | Where-Object { $_['sourceReportId'] -eq $BackupReportId })[0]
+        Assert-LocalBackup -Backup $backup -Item $backupItem
         $model['status'] = 'ImportRequested'
         Save-MigrationState
         $displayName = [uri]::EscapeDataString($model['name'] + '.pbix')
@@ -362,6 +382,7 @@ function Complete-ModelImport {
         Save-MigrationState
     }
     if ($model['status'] -eq 'Importing') {
+        Request-ActivityConfirmation -Activity 'PollImport' -Details "Pantau import '$($model['name'])' [$($model['importId'])] di workspace tujuan [$($target['id'])]. Hanya GET; tidak membuat import baru."
         for ($poll = 0; $poll -lt 180; $poll++) {
             $operation = Invoke-PowerBIApi -Method GET -Path "groups/$($target['id'])/imports/$($model['importId'])"
             if ($operation['id'] -ne $model['importId']) { throw 'ID operasi import berbeda dari state.' }
@@ -391,6 +412,7 @@ function Complete-ModelImport {
         }
         if ($model['status'] -eq 'Importing') { throw 'Import masih berjalan. Jalankan ulang dengan state yang sama untuk polling, bukan POST baru.' }
     }
+    Request-ActivityConfirmation -Activity 'VerifyModel' -Details "Periksa ID/nama dan referensi sumber/parameter model '$($model['name'])' [$($model['targetDatasetId'])] di tujuan [$($target['id'])], lalu catat hasil ke state."
     Assert-ModelSources -Model $model
     $model['status'] = 'SourcesVerified'
     Save-MigrationState
@@ -400,6 +422,8 @@ function Confirm-ModelRefresh {
     param([System.Collections.IDictionary]$Model)
     if ($Model['sourceCount'] -eq 0) { return }
     if (-not $Model.ContainsKey('refreshStatus') -or $Model['refreshStatus'] -eq 'Completed') {
+        Request-ActivityConfirmation -Activity 'RefreshModel' -Details "Refresh nyata model '$($Model['name'])' [$($Model['targetDatasetId'])] di tujuan [$($target['id'])]. Membaca sumber eksternal dan memakai resource capacity; report source belum dihapus."
+        Assert-ModelSources -Model $Model
         $Model['refreshStatus'] = 'Requested'
         $Model.Remove('refreshId')
         Save-MigrationState
@@ -438,6 +462,7 @@ function Confirm-ModelRefresh {
     if ($Model['refreshStatus'] -ne 'Running') {
         throw "Refresh '$($Model['name'])' berstatus $($Model['refreshStatus']). Konfigurasi credentials/gateway di Service dan tinjau state sebelum mencoba ulang."
     }
+    Request-ActivityConfirmation -Activity 'PollRefresh' -Details "Pantau refresh model '$($Model['name'])' [$($Model['refreshId'])] sampai Completed/gagal. Tidak mengulang POST refresh."
     for ($poll = 0; $poll -lt 180; $poll++) {
         $refresh = Invoke-PowerBIApi -Method GET -Path "groups/$($target['id'])/datasets/$($Model['targetDatasetId'])/refreshes/$($Model['refreshId'])" -AllowAccepted
         if ($refresh['status'] -eq 'Completed') {
@@ -456,14 +481,50 @@ function Confirm-ModelRefresh {
     throw 'Refresh masih berjalan; lanjutkan polling melalui state yang sama. Penghapusan sumber tidak dijalankan.'
 }
 
+function Assert-SourceDeletionSafety {
+    param([System.Collections.IDictionary]$Item, [System.Collections.IDictionary]$Record)
+    $targetReportId = [guid]::Empty
+    if (-not [guid]::TryParse([string]$Record['targetReportId'], [ref]$targetReportId) -or
+        $targetReportId -eq [guid]::Empty -or $Record['targetReportId'] -eq $Item['sourceReportId']) {
+        throw 'ID report tujuan tidak valid untuk penghapusan. Report asal tidak dihapus.'
+    }
+    Assert-LocalBackup -Backup $state['backups'][$Item['sourceReportId']] -Item $Item
+    foreach ($workspace in @($source, $target)) {
+        $current = Invoke-PowerBIApi -Method GET -Path "groups/$($workspace['id'])"
+        if ($current['id'] -ne $workspace['id'] -or $current['capacityId'] -ne $state['capacityId'] -or
+            $current['isOnDedicatedCapacity'] -ne $true -or $current['isReadOnly'] -ne $false) {
+            throw 'Workspace, capacity atau akses berubah sebelum DELETE. Report asal tidak dihapus.'
+        }
+    }
+    $expectedModel = if ($IncludeSemanticModels) { $Record['targetDatasetId'] } else { $Record['datasetId'] }
+    $currentTarget = Invoke-PowerBIApi -Method GET -Path "groups/$($target['id'])/reports/$($Record['targetReportId'])"
+    Assert-ReportBinding -Report $currentTarget -ExpectedId $Record['targetReportId'] -ExpectedName $Record['name'] -ExpectedDataset $expectedModel
+    if ($IncludeSemanticModels) {
+        $model = $state['models'][$Item['datasetId']]
+        Assert-ModelSources -Model $model
+        if ($Item['sourcePresent'] -and $model['sourceCount'] -gt 0 -and $model['refreshStatus'] -ne 'Completed') {
+            throw 'Refresh model tujuan belum Completed. Report asal tidak dihapus.'
+        }
+    }
+    if ($Item['sourcePresent']) {
+        $currentSource = Invoke-PowerBIApi -Method GET -Path "groups/$($source['id'])/reports/$($Item['sourceReportId'])"
+        Assert-ReportBinding -Report $currentSource -ExpectedId $Item['sourceReportId'] -ExpectedName $Item['name'] -ExpectedDataset $Item['datasetId']
+    }
+}
+
 $resolvedStatePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($StatePath)
 $resolvedBackupDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BackupDirectory)
 $lock = $null
 try {
+    if ($WhatIf) {
+        $Apply = $false
+        Write-Host 'WHATIF: hanya login dan pemeriksaan baca/preview; tidak ada backup, state, lock, POST atau DELETE.'
+    }
     if ($IncludeSemanticModels -and $BackupDownloadType -ne 'IncludeModel') {
         throw '-IncludeSemanticModels membutuhkan -BackupDownloadType IncludeModel.'
     }
     if ($Apply) {
+        Request-ActivityConfirmation -Activity 'PrepareLocal' -Details "Siapkan folder state dan lock eksklusif '$resolvedStatePath.lock'. Backup: '$resolvedBackupDirectory'. Mode: $Mode; sumber '$SourceWorkspace'; tujuan '$TargetWorkspace'."
         $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($resolvedStatePath))
         # Keep this file so concurrent processes always lock the same file.
         $lock = [IO.File]::Open("$resolvedStatePath.lock", [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -475,8 +536,10 @@ try {
             throw 'Pasang/update modul autentikasi: Install-Module MicrosoftPowerBIMgmt.Profile -MinimumVersion 1.3.84 -Scope CurrentUser -Force. Kemudian gunakan sesi PowerShell baru.'
         }
     }
+    Request-ActivityConfirmation -Activity 'Login' -Details "Buka login interaktif Power BI cloud Public. Pilih akun organisasi yang memiliki akses ke '$SourceWorkspace' dan '$TargetWorkspace'."
     Write-Host 'Login interaktif Power BI: pilih akun pengguna yang memiliki akses ke kedua workspace.'
     $null = Connect-PowerBIServiceAccount -Environment Public -ErrorAction Stop
+    Request-ActivityConfirmation -Activity 'Discovery' -Details "Baca workspace/capacity, state '$resolvedStatePath', report dan metadata model bila dipilih. Tidak membuat/menghapus item layanan."
     $workspaces = @(Get-PowerBIWorkspaces)
     $source = Resolve-Workspace -Workspaces $workspaces -Identifier $SourceWorkspace
     $target = Resolve-Workspace -Workspaces $workspaces -Identifier $TargetWorkspace
@@ -663,6 +726,7 @@ try {
         $plan | ForEach-Object { [pscustomobject]$_ }
         return
     }
+    Request-ActivityConfirmation -Activity 'ExecutePlan' -Details "Jalankan rencana $Mode untuk $($plan.Count) report dari '$($source['name'])' [$($source['id'])] ke '$($target['name'])' [$($target['id'])], capacity [$($source['capacityId'])]. IncludeSemanticModels=$([bool]$IncludeSemanticModels). Buat backup/manifest dan catat state '$resolvedStatePath'. Setiap aktivitas berikutnya tetap meminta persetujuan."
 
     $runDirectory = Join-Path $resolvedBackupDirectory (
         '{0}_to_{1}\{2}_{3}' -f $source['id'], $target['id'],
@@ -678,6 +742,8 @@ try {
     }
     foreach ($item in $plan) {
         $reportId = $item['sourceReportId']
+        $backupAction = if ($item['sourcePresent']) { 'Export PBIX baru' } else { 'Periksa backup lama untuk resume; sumber sudah tidak ada' }
+        Request-ActivityConfirmation -Activity 'BackupReport' -Details "$backupAction untuk '$($item['name'])' [$reportId], workspace source [$($source['id'])], jenis $BackupDownloadType; manifest run '$runDirectory'. Catat backup ke state; belum clone/DELETE."
         if ($item['sourcePresent']) {
             $backup = Save-ReportBackup -Item $item -Directory $runDirectory
         } else {
@@ -690,6 +756,7 @@ try {
         Save-MigrationState
         Write-Host "Backup verified: $($item['name']) -> $($backup['path'])"
     }
+    Request-ActivityConfirmation -Activity 'VerifyBackups' -Details "Periksa ulang seluruh $($plan.Count) backup lokal sebelum perubahan layanan; jika menyertakan model, periksa snapshot DataModel dan simpan fingerprint."
     foreach ($item in $plan) {
         Assert-LocalBackup -Backup $state['backups'][$item['sourceReportId']] -Item $item
     }
@@ -713,6 +780,13 @@ try {
     foreach ($item in $plan) {
         $reportId = $item['sourceReportId']
         if ($item['action'] -eq 'Clone') {
+            Request-ActivityConfirmation -Activity 'CloneReport' -Details "Salin report '$($item['name'])' [$reportId] dari source [$($source['id'])] ke destination [$($target['id'])]. ID/URL report baru; tidak menimpa. IncludeSemanticModels=$([bool]$IncludeSemanticModels)."
+            $currentSource = Invoke-PowerBIApi -Method GET -Path "groups/$($source['id'])/reports/$reportId"
+            Assert-ReportBinding -Report $currentSource -ExpectedId $reportId -ExpectedName $item['name'] -ExpectedDataset $item['datasetId']
+            $currentTargets = Invoke-PowerBIApi -Method GET -Path "groups/$($target['id'])/reports"
+            $newConflicts = @(Get-PowerBICollection -Response $currentTargets -Label 'report' | Where-Object { $_['name'] -eq $item['name'] })
+            if ($newConflicts.Count -gt 0) { throw 'Konflik report baru muncul setelah konfirmasi. Clone dibatalkan tanpa POST.' }
+            Assert-LocalBackup -Backup $state['backups'][$reportId] -Item $item
             $state['reports'][$reportId] = @{
                 name = $item['name']
                 datasetId = $item['datasetId']
@@ -739,6 +813,7 @@ try {
             Save-MigrationState
         }
         $record = $state['reports'][$reportId]
+        Request-ActivityConfirmation -Activity 'VerifyReport' -Details "GET dan verifikasi report '$($record['name'])' [$($record['targetReportId'])] di destination [$($target['id'])], cocokkan ID/nama/binding model, lalu catat hasil. Ini bukan uji visual/RLS."
         $verified = Invoke-PowerBIApi -Method GET -Path "groups/$($target['id'])/reports/$($record['targetReportId'])"
         $expectedModel = if ($IncludeSemanticModels) { $record['targetDatasetId'] } else { $record['datasetId'] }
         Assert-ReportBinding -Report $verified -ExpectedId $record['targetReportId'] -ExpectedName $record['name'] -ExpectedDataset $expectedModel
@@ -751,6 +826,8 @@ try {
         Write-Host "Verified: $($record['name']) [$($record['targetReportId'])]"
     }
     if ($Mode -eq 'Move') {
+        Request-ActivityConfirmation -Activity 'MoveCutover' -Details "CUTOVER ke '$($target['name'])' [$($target['id'])]. Dengan menyetujui, Anda menyatakan backup/pemulihan, visual, angka, akses/RLS dan persetujuan pemilik sudah diperiksa. Verifikasi API saja tidak membuktikannya. Report source yang masih ada akan dihapus satu per satu, bukan transaksi/rollback otomatis; model dan workspace source tetap ada." -RequiredText "CUTOVER $($target['id'])"
+        Request-ActivityConfirmation -Activity 'ValidateMove' -Details "Periksa ulang seluruh backup, model/koneksi tujuan dan sumber sebelum penghapusan pertama. Refresh model tujuan bila diperlukan akan meminta persetujuan terpisah."
         if ($IncludeSemanticModels) {
             foreach ($modelId in $modelIds) {
                 Assert-ModelSources -Model $state['models'][$modelId]
@@ -770,10 +847,26 @@ try {
         foreach ($item in $plan) {
             $record = $state['reports'][$item['sourceReportId']]
             $sourcePath = "groups/$($source['id'])/reports/$($item['sourceReportId'])"
+            if ($item['sourcePresent']) {
+                Request-ActivityConfirmation -Activity 'DeleteSource' -Details "HAPUS report '$($item['name'])' [$($item['sourceReportId'])] dari '$($source['name'])' [$($source['id'])]. Target '$($target['name'])' [$($target['id'])], report [$($record['targetReportId'])]. Backup '$($state['backups'][$item['sourceReportId']]['path'])'. ID/URL lama berhenti berlaku; tidak ada rollback otomatis. Setelah jawaban, semua pemeriksaan kritis diulang sebelum DELETE." -RequiredText "HAPUS $($item['sourceReportId']) DARI $($source['id'])"
+            } else {
+                Request-ActivityConfirmation -Activity 'VerifyDeletion' -Details "Resume report '$($item['name'])' [$($item['sourceReportId'])]: verifikasi target/backup dan pastikan source [$($source['id'])] memberikan HTTP 404. Tidak mengirim DELETE untuk sumber yang sudah hilang."
+            }
+            Assert-SourceDeletionSafety -Item $item -Record $record
             if ($record['status'] -ne 'SourceDeleted') {
                 Assert-LocalBackup -Backup $state['backups'][$item['sourceReportId']] -Item $item
                 $record['status'] = 'DeleteRequested'
                 $record['updatedAtUtc'] = [DateTimeOffset]::UtcNow.ToString('o')
+                if ($item['sourcePresent']) {
+                    $record['deletionApproval'] = @{
+                        approvedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+                        sourceReportId = $item['sourceReportId']
+                        sourceWorkspaceId = $source['id']
+                        targetWorkspaceId = $target['id']
+                        targetReportId = $record['targetReportId']
+                        backupSha256 = $state['backups'][$item['sourceReportId']]['sha256']
+                    }
+                }
                 Save-MigrationState
                 if ($item['sourcePresent']) {
                     Invoke-PowerBIApi -Method DELETE -Path $sourcePath

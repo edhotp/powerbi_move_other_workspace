@@ -128,6 +128,14 @@ function Reset-Mock {
         refreshResponseLost = $false
         pendingImportPolls = 0
         pendingRefreshPolls = 0
+        confirmations = [Collections.Generic.List[object]]::new()
+        confirmationCounts = @{}
+        declineActivity = $null
+        declineOccurrence = 1
+        confirmationAnswer = $null
+        confirmationAnswers = @{}
+        promptFailure = $false
+        onConfirmation = $null
     }
 }
 
@@ -147,6 +155,28 @@ function Get-PowerBIAccessToken {
     if ($global:mock['failToken']) { throw 'Mock Gagal mendapatkan token' }
     if ($global:mock['invalidToken']) { return @{ Authorization = 'invalid-token' } }
     return @{ Authorization = 'Bearer mock-token-not-a-secret' }
+}
+
+function Read-Host {
+    [CmdletBinding()]
+    param([string]$Prompt)
+    if ($global:mock['promptFailure']) { throw 'Mock interactive confirmation unavailable' }
+    Assert-True ($Prompt -match "^\[([A-Za-z]+)\] Ketik tepat '([^']+)'") 'Each confirmation identifies its activity and exact required response.'
+    $activity = $Matches[1]
+    $required = $Matches[2]
+    $global:mock['confirmations'].Add(@{ activity = $activity; required = $required })
+    if (-not $global:mock['confirmationCounts'].ContainsKey($activity)) { $global:mock['confirmationCounts'][$activity] = 0 }
+    $global:mock['confirmationCounts'][$activity]++
+    if ($null -ne $global:mock['onConfirmation']) {
+        $null = & $global:mock['onConfirmation'] $activity $required
+    }
+    if ($activity -eq $global:mock['declineActivity'] -and
+        $global:mock['confirmationCounts'][$activity] -eq $global:mock['declineOccurrence']) {
+        return ''
+    }
+    if ($global:mock['confirmationAnswers'].ContainsKey($activity)) { return $global:mock['confirmationAnswers'][$activity] }
+    if ($null -ne $global:mock['confirmationAnswer']) { return $global:mock['confirmationAnswer'] }
+    return $required
 }
 
 function Start-Sleep {
@@ -184,6 +214,9 @@ function Invoke-WebRequest {
         $data = @{ error = @{ code = 'TooManyRequests' } }
     } elseif ($path -match '^groups\?\$top=100&\$skip=(\d+)$') {
         $data = @{ value = @($global:mock['groups'] | Select-Object -Skip ([int]$Matches[1]) -First 100) }
+    } elseif ($path -match '^groups/([^/?]+)$') {
+        $id = $Matches[1]
+        $data = @($global:mock['groups'] | Where-Object { $_['id'] -eq $id })[0]
     } elseif ($path -eq "groups/$sourceId/reports") {
         $data = @{ value = $global:mock['sourceReports'] }
     } elseif ($path -eq "groups/$targetId/reports") {
@@ -539,8 +572,12 @@ try {
         $firstDelete = $global:mock['requests'].FindIndex([Predicate[object]]{ param($request) $request['method'] -eq 'DELETE' })
         $beforeDelete = @($global:mock['requests'] | Select-Object -First $firstDelete)
         Assert-True (@($beforeDelete | Where-Object { $_['method'] -eq 'POST' }).Count -eq 2) 'All clones before first DELETE.'
-        Assert-True (@($beforeDelete | Where-Object { $_['method'] -eq 'GET' -and $_['path'] -match "^groups/$targetId/reports/.+" }).Count -eq 2) 'All targets verified before first DELETE.'
-        Assert-True (@($beforeDelete | Where-Object { $_['method'] -eq 'GET' -and $_['path'] -match "^groups/$sourceId/reports/[^/?]+$" }).Count -eq 2) 'All sources rechecked before first DELETE.'
+        foreach ($targetReport in $global:mock['targetReports']) {
+            Assert-True (@($beforeDelete | Where-Object { $_['method'] -eq 'GET' -and $_['path'] -eq "groups/$targetId/reports/$($targetReport['id'])" }).Count -ge 1) 'All targets verified before first DELETE.'
+        }
+        foreach ($id in @($reportId, $secondReportId)) {
+            Assert-True (@($beforeDelete | Where-Object { $_['method'] -eq 'GET' -and $_['path'] -eq "groups/$sourceId/reports/$id" }).Count -ge 2) 'Each source is checked before clone and before first DELETE.'
+        }
         $null = & $migrationScript @parameters -Mode Move -ReportIds $reportId, $secondReportId -Apply
         Assert-True ($global:mock['postCount'] -eq 2 -and $global:mock['deleteCount'] -eq 2) 'Completed Move resumes without clone or DELETE replay.'
     }
@@ -742,10 +779,12 @@ try {
     }
     Test-Case 'null-json-is-not-source-absence' {
         $global:mock['leaveSourceAfterDelete'] = $true
-        Set-ResponseSequence -Method GET -Path "groups/$sourceId/reports/$reportId" -Responses @(
-            $null
-            (New-MockResponse -Content 'null')
-        )
+        $global:mock['onRequest'] = {
+            param($method, $path, $outFile)
+            if ($method -eq 'DELETE') {
+                Set-ResponseSequence -Method GET -Path $path -Responses @((New-MockResponse -Content 'null'))
+            }
+        }
         Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } 'Respons JSON.*tidak valid'
         $saved = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
         Assert-True ($saved['reports'][$reportId]['status'] -eq 'DeleteRequested') 'HTTP 200 null cannot become SourceDeleted.'
@@ -1094,6 +1133,231 @@ try {
         }
         Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'x-ms-request-id.*berbeda'
         Assert-True ($global:mock['deleteCount'] -eq 0) 'Inconsistent operation IDs cannot authorize source deletion.'
+    }
+    foreach ($activity in @(
+        'PrepareLocal', 'Login', 'Discovery', 'ExecutePlan', 'BackupReport', 'VerifyBackups',
+        'ImportModel', 'PollImport', 'VerifyModel', 'CloneReport', 'VerifyReport',
+        'MoveCutover', 'ValidateMove', 'RefreshModel', 'PollRefresh', 'DeleteSource'
+    )) {
+        Test-Case "decline-$activity" {
+            $global:mock['declineActivity'] = $activity
+            $parameters['IncludeSemanticModels'] = $true
+            Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } "Dibatalkan pada aktivitas '$activity'"
+            Assert-True ($global:mock['deleteCount'] -eq 0 -and $global:mock['sourceReports'].Count -eq 1) 'Declined activity cannot delete a source.'
+            if ($activity -in @('PrepareLocal', 'Login', 'Discovery')) {
+                Assert-True ($global:mock['requests'].Count -eq 0) 'Early rejection prevents all API calls.'
+            }
+            if ($activity -in @('PrepareLocal', 'Login', 'Discovery', 'ExecutePlan', 'BackupReport')) {
+                Assert-True ($global:mock['exportCount'] -eq 0 -and -not (Test-Path -LiteralPath $statePath)) 'No backup/state before the related approval.'
+            }
+            if ($activity -in @('VerifyBackups', 'ImportModel')) {
+                Assert-True ($global:mock['importCount'] -eq 0) 'No import before its approval.'
+            }
+            if ($activity -in @('PollImport', 'VerifyModel', 'CloneReport')) {
+                Assert-True ($global:mock['postCount'] -eq 0) 'No report clone after declining prerequisite activity.'
+            }
+            if ($activity -in @('VerifyReport', 'MoveCutover', 'ValidateMove', 'RefreshModel')) {
+                Assert-True ($global:mock['refreshCount'] -eq 0) 'No refresh before its own and cutover approvals.'
+            }
+            if (Test-Path -LiteralPath $statePath) {
+                $saved = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+                if ($activity -eq 'ImportModel') { Assert-True ($saved['models'][$datasetId]['status'] -eq 'Planned') 'Rejected import is not ImportRequested.' }
+                if ($activity -eq 'PollImport') { Assert-True ($saved['models'][$datasetId]['status'] -eq 'Importing') 'Accepted import ID survives polling cancellation.' }
+                if ($activity -eq 'VerifyReport') { Assert-True ($saved['reports'][$reportId]['status'] -eq 'Created') 'Accepted clone ID survives verify cancellation.' }
+                if ($activity -eq 'RefreshModel') { Assert-True (-not $saved['models'][$datasetId].ContainsKey('refreshStatus')) 'Rejected refresh is not marked Requested.' }
+                if ($activity -eq 'PollRefresh') { Assert-True ($saved['models'][$datasetId]['refreshStatus'] -eq 'Running') 'Accepted refresh ID survives polling cancellation.' }
+                if ($activity -eq 'DeleteSource') { Assert-True ($saved['reports'][$reportId]['status'] -eq 'Verified') 'Rejected DELETE is not marked DeleteRequested.' }
+            }
+            if (Test-Path -LiteralPath "$statePath.lock") {
+                $released = [IO.File]::Open("$statePath.lock", [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                $released.Dispose()
+            }
+            if ($activity -in @('ImportModel', 'PollImport', 'VerifyModel', 'CloneReport', 'VerifyReport', 'RefreshModel', 'PollRefresh', 'DeleteSource')) {
+                $global:mock['declineActivity'] = $null
+                $result = @(& $migrationScript @parameters -Mode Move -Apply)
+                Assert-True ($result[0].status -eq 'SourceDeleted' -and $global:mock['importCount'] -eq 1 -and $global:mock['postCount'] -eq 1) 'Resume after cancellation reuses accepted imports/clones.'
+                if ($activity -eq 'PollRefresh') { Assert-True ($global:mock['refreshCount'] -eq 1) 'Cancelled polling does not POST another refresh.' }
+            }
+        }
+    }
+    Test-Case 'approval-order-and-recorded-deletion' {
+        $null = & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply
+        $actual = @($global:mock['confirmations'] | ForEach-Object { $_['activity'] })
+        $expected = @('PrepareLocal','Login','Discovery','ExecutePlan','BackupReport','VerifyBackups','ImportModel','PollImport','VerifyModel','CloneReport','VerifyReport','MoveCutover','ValidateMove','RefreshModel','PollRefresh','DeleteSource')
+        Assert-True (($actual -join ',') -ceq ($expected -join ',')) 'Each logical activity requests approval in execution order.'
+        $cutover = @($global:mock['confirmations'] | Where-Object { $_['activity'] -eq 'MoveCutover' })[0]
+        $deletion = @($global:mock['confirmations'] | Where-Object { $_['activity'] -eq 'DeleteSource' })[0]
+        Assert-True ($cutover['required'] -ceq "CUTOVER $targetId") 'Cutover approval binds the actual destination ID.'
+        Assert-True ($deletion['required'] -ceq "HAPUS $reportId DARI $sourceId") 'Deletion approval binds report ID and source workspace ID.'
+        $saved = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $approval = $saved['reports'][$reportId]['deletionApproval']
+        Assert-True ($approval['sourceReportId'] -eq $reportId -and $approval['targetWorkspaceId'] -eq $targetId -and $approval['backupSha256'] -eq $saved['backups'][$reportId]['sha256']) 'Deletion journal records the approved pair and backup checksum.'
+    }
+    foreach ($mode in @('Copy','Move')) {
+        Test-Case "whatif-overrides-apply-$mode" {
+            $plan = @(& $migrationScript @parameters -IncludeSemanticModels -Mode $mode -Apply -WhatIf)
+            Assert-True ($plan.Count -eq 1 -and $global:mock['exportCount'] -eq 0 -and $global:mock['postCount'] -eq 0 -and $global:mock['importCount'] -eq 0 -and $global:mock['refreshCount'] -eq 0 -and $global:mock['deleteCount'] -eq 0) 'WhatIf never changes service state.'
+            Assert-True (-not (Test-Path -LiteralPath "$statePath.lock") -and -not (Test-Path -LiteralPath $statePath) -and -not (Test-Path -LiteralPath $backupDirectory)) 'WhatIf does not write state, backups or lock.'
+            Assert-True (($global:mock['confirmations'].activity -join ',') -eq 'Login,Discovery') 'WhatIf approves only read-only activities.'
+        }
+    }
+    foreach ($answer in @('', 'Y', 'YES', 'Yes to All', 'LANJUT', "HAPUS $reportId DARI $targetId")) {
+        Test-Case "delete-rejects-answer-$testCount" {
+            $global:mock['confirmationAnswers']['DeleteSource'] = $answer
+            Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } "Dibatalkan pada aktivitas 'DeleteSource'"
+            Assert-True ($global:mock['deleteCount'] -eq 0) 'Generic yes or the wrong workspace cannot authorize deletion.'
+        }
+    }
+    Test-Case 'per-report-delete-approval-required' {
+        $global:mock['sourceReports'] += @{ id = $secondReportId; name = 'Other'; datasetId = $datasetId }
+        $global:mock['declineActivity'] = 'DeleteSource'
+        $global:mock['declineOccurrence'] = 2
+        Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } "Dibatalkan pada aktivitas 'DeleteSource'"
+        Assert-True ($global:mock['deleteCount'] -eq 1 -and $global:mock['sourceReports'][0]['id'] -eq $secondReportId) 'Approval for first report cannot approve another DELETE.'
+        $saved = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        Assert-True ($saved['reports'][$reportId]['status'] -eq 'SourceDeleted' -and $saved['reports'][$secondReportId]['status'] -eq 'Verified') 'Partial approved result remains accurate after cancellation.'
+    }
+    Test-Case 'confirmation-input-unavailable-fails-closed' {
+        $global:mock['promptFailure'] = $true
+        Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } 'confirmation unavailable'
+        Assert-True ($global:mock['requests'].Count -eq 0 -and -not (Test-Path -LiteralPath "$statePath.lock")) 'Unavailable input cannot silently grant permission.'
+    }
+    Test-Case 'delete-revalidates-target-after-approval' {
+        $global:mock['onConfirmation'] = {
+            param($activity, $required)
+            if ($activity -eq 'DeleteSource') { $global:mock['targetReports'][0]['datasetId'] = $secondReportId }
+        }
+        Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } 'Verifikasi report.*gagal'
+        Assert-True ($global:mock['deleteCount'] -eq 0) 'Target rebinding while user considers approval blocks DELETE.'
+    }
+    Test-Case 'delete-revalidates-source-after-approval' {
+        $global:mock['onConfirmation'] = {
+            param($activity, $required)
+            if ($activity -eq 'DeleteSource') { $global:mock['sourceReports'][0]['name'] = 'Renamed during approval' }
+        }
+        Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } 'Verifikasi report.*gagal'
+        Assert-True ($global:mock['deleteCount'] -eq 0) 'Source changes after batch validation block DELETE.'
+    }
+    Test-Case 'delete-revalidates-capacity-after-approval' {
+        $global:mock['onConfirmation'] = {
+            param($activity, $required)
+            if ($activity -eq 'DeleteSource') { $global:mock['groups'][1]['capacityId'] = $secondReportId }
+        }
+        Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } 'Workspace, capacity atau akses berubah'
+        Assert-True ($global:mock['deleteCount'] -eq 0) 'Capacity drift during approval blocks DELETE.'
+    }
+    Test-Case 'delete-revalidates-backup-after-approval' {
+        $global:mock['onConfirmation'] = {
+            param($activity, $required)
+            if ($activity -eq 'DeleteSource') {
+                $saved = Get-Content -LiteralPath $global:mock['statePath'] -Raw | ConvertFrom-Json -AsHashtable
+                Change-BackupByte -Path $saved['backups'][$reportId]['path']
+            }
+        }
+        Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } 'Integritas backup.*gagal'
+        Assert-True ($global:mock['deleteCount'] -eq 0) 'Backup corruption while awaiting input blocks DELETE.'
+    }
+    Test-Case 'clone-rechecks-name-conflicts-after-approval' {
+        $global:mock['onConfirmation'] = {
+            param($activity, $required)
+            if ($activity -eq 'CloneReport') { $global:mock['targetReports'] += @{ id = $secondReportId; name = 'Sales'; datasetId = $datasetId } }
+        }
+        Assert-Throws { & $migrationScript @parameters -Apply } 'Konflik report baru'
+        Assert-True ($global:mock['postCount'] -eq 0) 'New conflict cannot be overwritten after user waiting.'
+        $saved = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        Assert-True ($saved['reports'].Count -eq 0) 'Cancelled clone does not leave uncertain CloneRequested state.'
+    }
+    Test-Case 'resume-absent-source-confirms-verification-only' {
+        $null = & $migrationScript @parameters -Mode Move -Apply
+        $before = $global:mock['confirmations'].Count
+        $global:mock['declineActivity'] = 'VerifyDeletion'
+        Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } "Dibatalkan pada aktivitas 'VerifyDeletion'"
+        $newPrompts = @($global:mock['confirmations'] | Select-Object -Skip $before)
+        Assert-True (@($newPrompts | Where-Object { $_['activity'] -eq 'DeleteSource' }).Count -eq 0 -and $global:mock['deleteCount'] -eq 1) 'Resume does not request or replay DELETE for already absent source.'
+    }
+    Test-Case 'noninteractive-process-fails-before-effects' {
+        $hostPath = (Get-Process -Id $PID).Path
+        $output = & $hostPath -NoProfile -NonInteractive -File $migrationScript `
+            -SourceWorkspace $sourceId -TargetWorkspace $targetId -StatePath $statePath `
+            -BackupDirectory $backupDirectory -Mode Move -Apply 2>&1
+        Assert-True ($LASTEXITCODE -ne 0 -and ($output | Out-String) -match 'NonInteractive|Read-Host') 'Real PowerShell host cannot silently approve interactive input.'
+        Assert-True (-not (Test-Path -LiteralPath $statePath) -and -not (Test-Path -LiteralPath "$statePath.lock") -and -not (Test-Path -LiteralPath $backupDirectory)) 'Real unattended invocation stops before lock, state or backups.'
+    }
+    Test-Case 'confirm-preference-cannot-bypass-approval' {
+        $ConfirmPreference = 'None'
+        $global:mock['declineActivity'] = 'CloneReport'
+        Assert-Throws { & $migrationScript @parameters -Apply } "Dibatalkan pada aktivitas 'CloneReport'"
+        Assert-True ($global:mock['postCount'] -eq 0) 'ConfirmPreference None cannot bypass mandatory typed activity approval.'
+    }
+    Test-Case 'second-backup-declined-preserves-earlier-backup' {
+        $global:mock['sourceReports'] += @{ id = $secondReportId; name = 'Other'; datasetId = $datasetId }
+        $global:mock['declineActivity'] = 'BackupReport'
+        $global:mock['declineOccurrence'] = 2
+        Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } "Dibatalkan pada aktivitas 'BackupReport'"
+        $saved = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        Assert-True ($saved['backups'].Count -eq 1 -and $saved['reports'].Count -eq 0 -and $global:mock['postCount'] -eq 0 -and $global:mock['deleteCount'] -eq 0) 'Cancellation retains approved backup without starting cloud mutations.'
+    }
+    Test-Case 'delete-revalidates-access-after-approval' {
+        $global:mock['onConfirmation'] = {
+            param($activity, $required)
+            if ($activity -eq 'DeleteSource') { $global:mock['groups'][0]['isReadOnly'] = $true }
+        }
+        Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } 'Workspace, capacity atau akses berubah'
+        Assert-True ($global:mock['deleteCount'] -eq 0) 'Read-only workspace after user waiting blocks DELETE.'
+    }
+    Test-Case 'delete-revalidates-model-sources-after-approval' {
+        $global:mock['onConfirmation'] = {
+            param($activity, $required)
+            if ($activity -eq 'DeleteSource') {
+                $id = $global:mock['targetModels'][0]['id']
+                $global:mock['modelParameters'][$id][0]['currentValue'] = 'modified-while-waiting.example.test'
+            }
+        }
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'Referensi sources/parameter.*berbeda'
+        Assert-True ($global:mock['deleteCount'] -eq 0 -and $global:mock['refreshCount'] -eq 1) 'Changed target parameters block DELETE even after successful refresh.'
+    }
+    Test-Case 'delete-target-unavailable-after-approval' {
+        $global:mock['onConfirmation'] = {
+            param($activity, $required)
+            if ($activity -eq 'DeleteSource') {
+                $id = $global:mock['targetReports'][0]['id']
+                Set-ResponseSequence -Method GET -Path "groups/$targetId/reports/$id" -Responses @((New-MockResponse -Status 404))
+            }
+        }
+        Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } 'HTTP 404'
+        $saved = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        Assert-True ($global:mock['deleteCount'] -eq 0 -and $saved['reports'][$reportId]['status'] -eq 'Verified') 'Missing target after confirmation stops before DeleteRequested or DELETE.'
+    }
+    Test-Case 'import-backup-changed-during-approval' {
+        $global:mock['onConfirmation'] = {
+            param($activity, $required)
+            if ($activity -eq 'ImportModel') {
+                $saved = Get-Content -LiteralPath $global:mock['statePath'] -Raw | ConvertFrom-Json -AsHashtable
+                Change-BackupByte -Path $saved['backups'][$reportId]['path']
+            }
+        }
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Apply } 'Integritas backup.*gagal'
+        $saved = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        Assert-True ($global:mock['importCount'] -eq 0 -and $saved['models'][$datasetId]['status'] -eq 'Planned') 'Corrupted backup after import approval cannot be uploaded or marked requested.'
+    }
+    Test-Case 'clone-backup-changed-during-approval' {
+        $global:mock['onConfirmation'] = {
+            param($activity, $required)
+            if ($activity -eq 'CloneReport') {
+                $saved = Get-Content -LiteralPath $global:mock['statePath'] -Raw | ConvertFrom-Json -AsHashtable
+                Change-BackupByte -Path $saved['backups'][$reportId]['path']
+            }
+        }
+        Assert-Throws { & $migrationScript @parameters -Apply } 'Integritas backup.*gagal'
+        Assert-True ($global:mock['postCount'] -eq 0) 'Corrupted backup during clone approval prevents POST.'
+    }
+    Test-Case 'confirm-false-is-not-a-bypass-parameter' {
+        Assert-Throws { & $migrationScript @parameters -Apply -Confirm:$false } 'parameter.*Confirm'
+        Assert-True ($global:mock['confirmations'].Count -eq 0 -and $global:mock['requests'].Count -eq 0) 'Unsupported bypass attempt fails before effects.'
+    }
+    Test-Case 'force-is-not-a-bypass-parameter' {
+        Assert-Throws { & $migrationScript @parameters -Apply -Force } 'parameter.*Force'
+        Assert-True ($global:mock['confirmations'].Count -eq 0 -and $global:mock['requests'].Count -eq 0) 'Force cannot skip mandatory approvals.'
     }
     if ($failures.Count -gt 0) {
         throw "$($failures.Count) of $testCount unit tests failed:`n$($failures -join "`n")"

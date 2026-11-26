@@ -2,6 +2,35 @@
 
 Script [Migrate-PowerBIReports.ps1](Migrate-PowerBIReports.ps1) memakai **Power BI REST API Clone Report** untuk report. Dengan **`-IncludeSemanticModels`**, model terkait juga diimpor dari backup PBIX ke destination dan report dihubungkan ke model baru. Sebelum Copy/Move, script mengekspor **backup PBIX lokal** melalui Export Report API. Mode **Move** menambahkan Delete Report setelah verifikasi. Kedua workspace harus sudah ada, berada dalam tenant yang sama, dan memiliki **capacityId yang sama**. Script tidak membuat workspace atau mengubah capacity.
 
+## Disclaimer
+
+> **Gunakan dengan risiko dan tanggung jawab Anda sendiri.** Script disediakan **apa adanya (as-is)** sebagai alat bantu otomatisasi, tanpa jaminan keberhasilan migrasi, kelengkapan backup/pemulihan, ketersediaan layanan, atau kesesuaian untuk seluruh konfigurasi Power BI/Fabric. Penggunaan API Microsoft tidak berarti proyek ini merupakan produk resmi, disertifikasi, atau didukung oleh Microsoft.
+
+- **Ada operasi destruktif.** `-Mode Move -Apply` mengizinkan penghapusan report asal tanpa konfirmasi tambahan. Proses bukan satu transaksi, dapat selesai sebagian, dan tidak menyediakan rollback otomatis. ID/URL baru dapat memutus link, embed, app atau integrasi lama.
+- **Pengguna wajib memiliki otorisasi.** Dapatkan persetujuan pemilik data/report, ikuti kebijakan organisasi, dan gunakan akun dengan izin yang sesuai. Jangan gunakan script untuk melewati kontrol akses, sensitivity labels atau pembatasan export tenant.
+- **Backup bukan jaminan pemulihan.** Uji Copy dan pemulihan di lingkungan nonproduksi, validasi visual/angka/RLS sebagai pengguna tujuan, lalu ikuti [langkah aman migrasi](#langkah-aman-migrasi). Pemeriksaan hash dan status API tidak membuktikan seluruh fitur atau konfigurasi layanan telah terbawa.
+- **Lindungi data lokal.** PBIX, manifest dan state dapat memuat data atau metadata sensitif. Terapkan pembatasan akses, enkripsi disk dan retensi sesuai kebijakan; jangan upload backup, token, credentials atau state ke repo publik.
+- **Batas pengujian tetap berlaku.** Unit test dan tes API sample yang tercatat bukan jaminan untuk tenant produksi. Copy report + model telah diuji, tetapi Move dengan model pada sample SQL terblokir karena credentials tidak tersedia. Login interaktif modul Power BI serta validasi visual/RLS belum diverifikasi melalui tes langsung tersebut.
+- **Perubahan layanan dan biaya perlu ditinjau.** API, lisensi dan batas export dapat berubah. Import/refresh memakai sumber daya capacity dan dapat memengaruhi workload lain atau biaya sesuai konfigurasi Anda.
+- **Batas tanggung jawab.** Sejauh diizinkan hukum yang berlaku, penulis dan kontributor tidak bertanggung jawab atas kehilangan data, gangguan layanan, biaya atau kerugian akibat penggunaan script. Disclaimer ini tidak membatasi hak atau kewajiban yang tidak dapat dikecualikan menurut hukum, dan bukan pengganti lisensi proyek atau ketentuan layanan Microsoft.
+
+## Ringkasan cakupan
+
+| Komponen | Dicakup script | Batas penting |
+| --- | --- | --- |
+| Report biasa, halaman dan visual | Copy melalui Clone API; Move menambahkan penghapusan report asal | ID/URL baru; tampilan dan angka tetap harus diuji |
+| Semantic model terkait | Opsional melalui `-IncludeSemanticModels`; satu model bersama diimpor sekali | Hanya model Import refreshable di workspace source, export IncludeModel didukung, PBIX < 1 GB |
+| Referensi sumber dan parameter | Diperiksa kecocokannya pada model source/destination | Bukan penyalinan data fisik atau pembuktian credentials/koneksi aktif |
+| Backup lokal | PBIX, manifest, ukuran dan SHA256 sebelum perubahan | Bukan backup seluruh workspace; uji pemulihan tetap diperlukan |
+| Preview, konflik dan resume | Validasi workspace/capacity, nama, binding, state dan ID operasi | Gunakan state yang sama; tidak ada overwrite atau rollback otomatis |
+| Credentials, gateway binding, refresh schedule | Tidak disalin | Konfigurasi dan uji di Power BI Service |
+| Workspace access, sharing, keanggotaan RLS, app/audience, subscriptions, dashboard tiles, folder, endorsement dan labels | Tidak dimigrasikan atau diverifikasi | Tinjau manual; jangan menganggap izin pengguna ikut terbawa |
+| Database, file sumber, Lakehouse, Warehouse, dataflow dan pipeline | Tidak dipindahkan | Referensi ke source/asset lama tetap menjadi dependensi |
+| Direct Lake, DirectQuery/nonrefreshable dan paginated/RDL | Tidak didukung oleh jalur migrasi model/report ini | Jangan memakai opsi lain untuk melewati pembatasan |
+| Model dan workspace asal | Tidak dihapus, termasuk pada Move | Menutup workspace lama memerlukan audit dependensi terpisah |
+
+**Jalur yang disarankan:** [persiapan -> preview -> Copy + backup -> uji pengguna dan koneksi -> preview Move -> Move terkontrol](#langkah-aman-migrasi). Default tetap report-only; sertakan `-IncludeSemanticModels` jika model juga harus disalin.
+
 ## Pilihan Copy atau Move
 
 | Mode | Report tujuan | Report asal |
@@ -286,13 +315,93 @@ PBIX tidak mencadangkan workspace access, app/audience, subscriptions, gateway c
 
 `Verified` hanya berarti **identitas dan binding dataset lolos pemeriksaan API**, bukan bahwa visual, angka, izin atau RLS telah diuji.
 
-## Checklist sebelum cutover
+## Langkah aman migrasi
 
-1. Pastikan backup PBIX dan manifest tersimpan di laptop, lalu uji salinan backup di Power BI Desktop. Buka URL report tujuan dari state dan periksa semua halaman, slicer, drillthrough, bookmarks, custom visuals dan angka.
-2. Uji sebagai **Viewer/pengguna tujuan**, termasuk RLS dan akses semantic model lintas-workspace; pengujian sebagai Admin saja tidak cukup.
-3. Konfigurasi workspace access, sharing, labels dan subscriptions yang diperlukan.
-4. Publish/update app dari workspace baru bila digunakan, serta perbarui URL/embed/Teams/dashboard yang menunjuk report lama.
-5. Pertahankan report sumber dengan mode Copy sampai penerimaan selesai, lalu gunakan Move jika memang perlu menghapus report asal. **Jangan hapus workspace/model lama selama report baru masih terhubung ke model tersebut.**
+> **Jangan langsung menjalankan Move di produksi.** Mulai dengan satu report pada workspace uji, lalu Copy. `-Mode Move -Apply` adalah izin menghapus report asal dan **tidak menampilkan konfirmasi tambahan**. Report yang sudah dihapus tidak otomatis kembali jika tahap berikutnya gagal.
+
+### 1. Persiapan dan batas perubahan
+
+- Penuhi [prasyarat](#prasyarat) dan pasang modul autentikasi di PowerShell 7. Pastikan login memakai akun organisasi yang benar, bukan hanya akun Admin yang kebetulan aktif.
+- Catat ID workspace asal/tujuan, capacity, report yang dipilih, model bersama, serta sumber data/asset upstream. Gunakan ID untuk menghindari nama workspace yang sama atau salah ketik.
+- Siapkan destination kosong atau tanpa konflik nama, lokasi backup dengan ruang cukup, dan lokasi state yang dibatasi aksesnya. PBIX dapat berisi data perusahaan; gunakan disk encryption dan jangan simpan di repo publik atau folder sinkronisasi yang tidak disetujui.
+- Sepakati jendela cutover dan persetujuan pemilik report/data. Selama Copy sampai Move selesai, hentikan perubahan report/model serta refresh model **source** secara terkoordinasi; snapshot yang berubah dapat memblokir resume. Jika jadwal source dijeda, catat cara mengaktifkannya kembali jika cutover dibatalkan.
+- Jangan mengubah password/server/database atau memindahkan asset sumber dalam jendela yang sama. Jangan menjalankan dua migrasi bersamaan untuk pasangan yang sama.
+
+### 2. Simpan parameter satu batch, lalu preview
+
+Contoh ini menyertakan model dan membatasi satu report terlebih dahulu. **Ganti semua placeholder**, jalankan dari folder script, dan pertahankan nilai yang sama untuk batch ini. Jika hanya report yang dibutuhkan, hapus `IncludeSemanticModels` **sebelum pemanggilan pertama**, bukan di tengah proses.
+
+```powershell
+$migration = @{
+    SourceWorkspace = "<SOURCE-WORKSPACE-ID>"
+    TargetWorkspace = "<DESTINATION-WORKSPACE-ID>"
+    ReportIds = @("<REPORT-ID>")
+    IncludeSemanticModels = $true
+    BackupDownloadType = "IncludeModel"
+    BackupDirectory = "C:\PowerBI-Backups"
+    StatePath = "C:\PowerBI-Migration\migration-prod.json"
+}
+
+# Preview: belum membuat backup, report atau model.
+.\Migrate-PowerBIReports.ps1 @migration -Mode Copy
+```
+
+Periksa workspace/capacity, nama report, datasetId dan tindakan yang ditampilkan. Selesaikan konflik atau tipe model yang tidak didukung **sebelum Apply**. Preview bukan bukti export atau refresh akan berhasil. Untuk batch lain, tentukan state khusus yang baru; jangan mengganti state untuk menghindari error batch yang sama.
+
+### 3. Copy dan pastikan backup benar-benar ada
+
+```powershell
+.\Migrate-PowerBIReports.ps1 @migration -Mode Copy -Apply
+```
+
+- Tunggu proses selesai. Catat ID/URL report dan target model dari state, serta lokasi manifest backup.
+- Pastikan semua report terpilih memiliki PBIX dan entri manifest, ukuran tidak nol, serta hash sesuai. Manifest sebagian setelah kegagalan **bukan** bukti seluruh batch berhasil.
+- Uji **salinan** PBIX di Power BI Desktop terbaru. Untuk migrasi penting, lakukan latihan restore ke workspace Recovery terpisah, bukan menimpa source/destination. Restore tidak otomatis dilakukan script.
+- Jangan mengedit/menghapus backup asli atau state. Simpan salinan state/manifest secara aman setelah proses berhenti, bukan saat script sedang menulis.
+
+### 4. Siapkan destination dan uji sebagai pengguna
+
+- Pada model destination di Power BI Service, periksa **Settings**, **Gateway and cloud connections**, **Data source credentials**, serta parameter. Konfigurasi akses ke sumber yang sama; jangan menganggap credentials/gateway ikut tersalin.
+- Jalankan dan pastikan refresh target berhasil bila model memakai sumber eksternal. Tes manual ini tidak menggantikan pemeriksaan refresh yang akan dijalankan script pada Move.
+- Cocokkan seluruh halaman, slicer, filter, drillthrough, bookmarks, custom visuals dan angka dengan source. Untuk IncludeSemanticModels, pastikan report benar-benar memakai **model baru di destination**, bukan model source.
+- Uji sebagai **Viewer/pengguna tujuan** dan periksa RLS. Hasil Admin saja tidak cukup; atur keanggotaan role melalui Power BI Service sesuai kebijakan organisasi.
+- Siapkan workspace access, sharing, labels, subscriptions, jadwal refresh target dan app/audience yang diperlukan. Tinjau URL/embed/Teams/dashboard yang perlu diperbarui karena ID report berubah.
+- Dapatkan penerimaan pemilik report/data. Jika ada satu pemeriksaan gagal, **tetap gunakan Copy dan jangan lanjut Move**. Jangan mengedit isi model destination untuk mengakali perbedaan saat memakai state yang sama.
+
+### 5. Preview Move, lalu jalankan hanya setelah disetujui
+
+```powershell
+# Tetap tanpa penghapusan; periksa rencana Delete pada report asal.
+.\Migrate-PowerBIReports.ps1 @migration -Mode Move
+
+# Hanya setelah backup, uji pengguna dan persetujuan cutover lengkap.
+.\Migrate-PowerBIReports.ps1 @migration -Mode Move -Apply
+```
+
+Gunakan **state, cakupan model dan pilihan report yang sama** dengan Copy. Jangan hapus `-ReportIds` saat cutover karena itu bisa menambahkan seluruh report source ke batch.
+
+Dengan IncludeSemanticModels dan sumber eksternal, Move meminta refresh model target dan menunggu `Completed`; error credentials atau hasil yang belum pasti menghentikan proses sebelum penghapusan. Pemeriksaan ini tidak membuktikan setiap visual/RLS benar dan tidak menggantikan penerimaan pengguna.
+
+### 6. Periksa hasil dan pertahankan jalur pemulihan
+
+- Pastikan status report yang dipindahkan `SourceDeleted`, report source tidak ditemukan, dan report/model destination tetap tersedia dengan binding yang benar. `Verified` saja tidak berarti Move selesai.
+- Alihkan pengguna/app/link ke destination sesuai rencana, lalu pantau refresh dan akses pengguna. Simpan backup, manifest, state dan persetujuan sesuai kebijakan retensi.
+- **Jangan hapus model atau workspace source hanya karena Move selesai.** Audit report lintas-workspace, dataflow/Lakehouse/Warehouse dan dependensi lain terlebih dahulu; script tidak melakukan audit menyeluruh itu.
+- Bila rencana cutover dibatalkan sebelum Move, source masih dapat digunakan: kembalikan link/app sesuai rencana dan aktifkan kembali jadwal source yang dijeda. Jangan menghapus target secara otomatis karena mungkin sudah dipakai.
+- Jika sebagian report asal sudah terhapus, tidak ada rollback satu klik. Tinjau state dan pulihkan hanya item yang diperlukan melalui backup yang telah diuji; ID/URL dan konfigurasi layanan mungkin perlu ditata ulang.
+
+### Kondisi yang wajib menghentikan proses
+
+| Kondisi | Tindakan aman |
+| --- | --- |
+| Backup gagal, hilang, berubah atau belum diuji pemulihannya | Jangan lanjut Move; selesaikan masalah backup terlebih dahulu |
+| Credentials/gateway belum siap atau refresh target gagal | Pertahankan source, konfigurasi koneksi di Service; jangan melewati gate refresh |
+| Timeout, `ImportRequested`/`CloneRequested` atau refresh belum pasti | Periksa ID operasi di state dan layanan; jangan mengulang POST atau mengganti state secara buta |
+| Nama, model binding, parameter atau snapshot berubah | Hentikan cutover dan tinjau perubahan dengan pemilik model; jangan mengadopsi target hanya karena namanya sama |
+| Visual/angka/RLS/akses pengguna berbeda | Tetap gunakan source sampai penerimaan berhasil |
+| Perlu memindahkan data fisik atau menghapus workspace asal | Buat alur dan audit dependensi terpisah, bukan menambah DELETE manual pada script |
+
+Lihat [penanganan state dan kegagalan](#state-kegagalan-dan-menjalankan-ulang) sebelum memperbaiki state atau mencoba resume. **Jangan menandai `Completed`, `Verified` atau `SourceDeleted` secara manual untuk melewati pemeriksaan yang gagal.**
 
 ## Pengujian lokal tanpa akses tenant
 

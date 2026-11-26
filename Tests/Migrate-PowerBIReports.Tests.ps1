@@ -28,13 +28,17 @@ function Assert-Throws {
 }
 
 function New-ArchiveFixture {
-    param([string]$EntryName = 'Report/Layout')
+    param([string]$EntryName = 'Report/Layout', [switch]$OmitDataModel, [string]$ModelContent = 'mock binary model payload')
     $stream = [IO.MemoryStream]::new()
     try {
         $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create, $true)
         try {
             $writer = [IO.StreamWriter]::new($archive.CreateEntry($EntryName).Open())
             try { $writer.Write('mock report backup payload') } finally { $writer.Dispose() }
+            if ($EntryName -eq 'Report/Layout' -and -not $OmitDataModel) {
+                $writer = [IO.StreamWriter]::new($archive.CreateEntry('DataModel').Open())
+                try { $writer.Write($ModelContent) } finally { $writer.Dispose() }
+            }
         } finally {
             $archive.Dispose()
         }
@@ -103,6 +107,27 @@ function Reset-Mock {
         responseOverrides = @{}
         exportHeaderOverrides = @{}
         onRequest = $null
+        sourceModels = @{
+            $datasetId = @{ id = $datasetId; name = 'Sales Model'; isRefreshable = $true }
+        }
+        targetModels = @()
+        modelSources = @{
+            $datasetId = @(@{ datasourceType = 'Sql'; connectionDetails = @{ server = 'sql.example.test'; database = 'Sales' } })
+        }
+        modelParameters = @{
+            $datasetId = @(@{ name = 'Server'; type = 'Text'; currentValue = 'sql.example.test'; isRequired = $true })
+        }
+        imports = @{}
+        importCount = 0
+        importFailure = $false
+        importResponseLost = $false
+        importedSourcesMismatch = $false
+        importedParametersMismatch = $false
+        refreshCount = 0
+        refreshFailure = $false
+        refreshResponseLost = $false
+        pendingImportPolls = 0
+        pendingRefreshPolls = 0
     }
 }
 
@@ -130,11 +155,11 @@ function Start-Sleep {
 }
 
 function Invoke-WebRequest {
-    param($Uri, $Method, $Headers, $Body, $ContentType, $TimeoutSec, $MaximumRedirection, [switch]$SkipHttpErrorCheck, $OutFile, [switch]$PassThru)
+    param($Uri, $Method, $Headers, $Body, $ContentType, $TimeoutSec, $MaximumRedirection, [switch]$SkipHttpErrorCheck, $OutFile, [switch]$PassThru, $Form)
     Assert-True ($Uri.StartsWith('https://api.powerbi.com/v1.0/myorg/')) 'Unexpected API host.'
     Assert-True ($Headers.Authorization -eq 'Bearer mock-token-not-a-secret') 'Unexpected token.'
     $path = $Uri.Substring('https://api.powerbi.com/v1.0/myorg/'.Length)
-    $global:mock['requests'].Add(@{ method = $Method; path = $path; body = $Body })
+    $global:mock['requests'].Add(@{ method = $Method; path = $path; body = $Body; form = $Form })
     if ($null -ne $global:mock['onRequest']) {
         $null = & $global:mock['onRequest'] $Method $path $OutFile
     }
@@ -163,6 +188,68 @@ function Invoke-WebRequest {
         $data = @{ value = $global:mock['sourceReports'] }
     } elseif ($path -eq "groups/$targetId/reports") {
         $data = @{ value = $global:mock['targetReports'] }
+    } elseif ($path -eq "groups/$targetId/datasets") {
+        $data = @{ value = $global:mock['targetModels'] }
+    } elseif ($Method -eq 'POST' -and $path -match "^groups/$targetId/imports\?datasetDisplayName=.+&nameConflict=Abort&skipReport=true$") {
+        Assert-True ($null -ne $Form -and $Form['file'] -is [IO.FileInfo]) 'Import uses a real multipart file.'
+        $saved = Get-Content -LiteralPath $global:mock['statePath'] -Raw | ConvertFrom-Json -AsHashtable
+        $pending = @($saved['models'].GetEnumerator() | Where-Object { $_.Value['status'] -eq 'ImportRequested' })
+        Assert-True ($pending.Count -eq 1) 'ImportRequested must be journaled before POST.'
+        $originalId = $pending[0].Key
+        $newModelId = [guid]::NewGuid().ToString()
+        $importId = [guid]::NewGuid().ToString()
+        $model = @{ id = $newModelId; name = $pending[0].Value['name']; isRefreshable = $true }
+        $global:mock['targetModels'] += $model
+        $global:mock['modelSources'][$newModelId] = @($global:mock['modelSources'][$originalId] | ConvertTo-Json -Depth 20 -AsArray | ConvertFrom-Json -AsHashtable)
+        $global:mock['modelParameters'][$newModelId] = @($global:mock['modelParameters'][$originalId] | ConvertTo-Json -Depth 20 -AsArray | ConvertFrom-Json -AsHashtable)
+        if ($global:mock['importedSourcesMismatch'] -and $global:mock['modelSources'][$newModelId].Count -gt 0) {
+            $global:mock['modelSources'][$newModelId][0]['connectionDetails']['server'] = 'different.example.test'
+        }
+        if ($global:mock['importedParametersMismatch'] -and $global:mock['modelParameters'][$newModelId].Count -gt 0) {
+            $global:mock['modelParameters'][$newModelId][0]['currentValue'] = 'different.example.test'
+        }
+        $global:mock['imports'][$importId] = @{
+            id = $importId
+            importState = if ($global:mock['importFailure']) { 'Failed' } else { 'Succeeded' }
+            datasets = @($model)
+            reports = @()
+        }
+        $global:mock['importCount']++
+        if ($global:mock['importResponseLost']) { throw [TimeoutException]::new('Mock import response lost') }
+        return New-MockResponse -Status 202 -Content (@{ id = $importId } | ConvertTo-Json -Compress)
+    } elseif ($Method -eq 'GET' -and $path -match "^groups/$targetId/imports/([^/?]+)$") {
+        $data = $global:mock['imports'][$Matches[1]].Clone()
+        if ($global:mock['pendingImportPolls'] -gt 0) {
+            $global:mock['pendingImportPolls']--
+            $data['importState'] = 'Publishing'
+        }
+    } elseif ($path -match '^groups/([^/]+)/datasets/([^/?]+)(?:/(datasources|parameters))?$') {
+        $workspaceId = $Matches[1]
+        $id = $Matches[2]
+        $operation = if ($Matches.ContainsKey(3)) { $Matches[3] } else { '' }
+        if ($operation -eq 'datasources') {
+            $data = @{ value = $global:mock['modelSources'][$id] }
+        } elseif ($operation -eq 'parameters') {
+            $data = @{ value = $global:mock['modelParameters'][$id] }
+        } elseif ($workspaceId -eq $sourceId) {
+            if (-not $global:mock['sourceModels'].ContainsKey($id)) { return New-MockResponse -Status 404 }
+            $data = $global:mock['sourceModels'][$id]
+        } else {
+            $data = @($global:mock['targetModels'] | Where-Object { $_['id'] -eq $id })[0]
+        }
+    } elseif ($Method -eq 'POST' -and $path -match "^groups/$targetId/datasets/([^/?]+)/refreshes$") {
+        $global:mock['refreshCount']++
+        if ($global:mock['refreshResponseLost']) { throw [TimeoutException]::new('Mock refresh response lost') }
+        return New-MockResponse -Status 202 -Headers @{
+            Location = @("$Uri/$([guid]::NewGuid().ToString())")
+        }
+    } elseif ($Method -eq 'GET' -and $path -match "^groups/$targetId/datasets/[^/?]+/refreshes/[^/?]+$") {
+        $data = @{ status = if ($global:mock['refreshFailure']) { 'Failed' } else { 'Completed' } }
+        if ($global:mock['pendingRefreshPolls'] -gt 0) {
+            $global:mock['pendingRefreshPolls']--
+            $data['status'] = 'InProgress'
+            $status = 202
+        }
     } elseif ($Method -eq 'GET' -and $path -match "^groups/$sourceId/reports/([^/]+)/Export\?downloadType=(IncludeModel|LiveConnect)$") {
         Assert-True (-not [string]::IsNullOrWhiteSpace($OutFile) -and $PassThru) 'Export must stream to local file with response headers.'
         $global:mock['exportCount']++
@@ -196,7 +283,9 @@ function Invoke-WebRequest {
         $sourceReport = @($global:mock['sourceReports'] | Where-Object { $_['id'] -eq $Matches[2] })[0]
         $payload = [Text.Encoding]::UTF8.GetString($Body) | ConvertFrom-Json -AsHashtable
         Assert-True ($payload['targetWorkspaceId'] -eq $targetId) 'Clone targetWorkspaceId mismatch.'
-        Assert-True (-not $payload.ContainsKey('targetModelId')) 'Clone must keep original semantic model.'
+        if ($payload.ContainsKey('targetModelId')) {
+            Assert-True (@($global:mock['targetModels'] | Where-Object { $_['id'] -eq $payload['targetModelId'] }).Count -eq 1) 'Clone uses a verified imported target model.'
+        }
         Assert-True ($payload['name'] -ceq $sourceReport['name']) 'Clone report name mismatch.'
         if ($global:mock['throttlePost']) {
             return [pscustomobject]@{ StatusCode = 429; Content = '{"error":{"code":"TooManyRequests"}}'; Headers = @{ 'Retry-After' = @('7') } }
@@ -205,7 +294,7 @@ function Invoke-WebRequest {
         $data = @{
             id = $newId
             name = $payload['name']
-            datasetId = $sourceReport['datasetId']
+            datasetId = if ($payload.ContainsKey('targetModelId')) { $payload['targetModelId'] } else { $sourceReport['datasetId'] }
             webUrl = "https://app.powerbi.com/groups/$targetId/reports/$newId"
         }
         $global:mock['targetReports'] += $data
@@ -816,6 +905,195 @@ try {
         $global:mock['onRequest'] = $null
         $null = & $migrationScript @parameters -Mode Move -Apply
         Assert-True ($global:mock['postCount'] -eq 2 -and $global:mock['deleteCount'] -eq 2) 'Explicit resume refreshes remaining backup without cloning again.'
+    }
+    Test-Case 'model-preview-no-mutation' {
+        $preview = @(& $migrationScript @parameters -IncludeSemanticModels)
+        Assert-True ($preview.Count -eq 1 -and $global:mock['importCount'] -eq 0 -and $global:mock['exportCount'] -eq 0) 'Model preview performs discovery only.'
+        Assert-True (-not (Test-Path -LiteralPath $statePath)) 'Model preview does not write a migration journal.'
+    }
+    Test-Case 'model-copy-import-and-target-binding' {
+        $result = @(& $migrationScript @parameters -IncludeSemanticModels -Apply)
+        $saved = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $targetModelId = $saved['models'][$datasetId]['targetDatasetId']
+        Assert-True ($global:mock['importCount'] -eq 1 -and $targetModelId -ne $datasetId) 'Exactly one independent model imported.'
+        Assert-True ($result[0].targetDatasetId -eq $targetModelId -and $global:mock['targetReports'][0]['datasetId'] -eq $targetModelId) 'Report binds to model in destination, not the source model.'
+        Assert-True ($global:mock['sourceModels'].ContainsKey($datasetId) -and $global:mock['deleteCount'] -eq 0) 'Copy retains all sources.'
+        Assert-True (-not (Get-Content -LiteralPath $statePath -Raw).Contains('sql.example.test')) 'State stores only a hash of source/parameter values.'
+        $null = & $migrationScript @parameters -IncludeSemanticModels -Apply
+        Assert-True ($global:mock['importCount'] -eq 1 -and $global:mock['postCount'] -eq 1) 'Repeated Copy reuses both model and report.'
+    }
+    Test-Case 'model-shared-by-two-reports' {
+        $global:mock['sourceReports'] += @{ id = $secondReportId; name = 'Other'; datasetId = $datasetId }
+        $result = @(& $migrationScript @parameters -IncludeSemanticModels -Apply)
+        Assert-True ($global:mock['importCount'] -eq 1 -and $result.Count -eq 2) 'Shared model is imported once.'
+        Assert-True (@($result | Select-Object -ExpandProperty targetDatasetId -Unique).Count -eq 1) 'Both reports share the same target model.'
+    }
+    Test-Case 'model-move-refresh-before-delete' {
+        $global:mock['pendingImportPolls'] = 1
+        $global:mock['pendingRefreshPolls'] = 1
+        $result = @(& $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply)
+        Assert-True ($result[0].status -eq 'SourceDeleted' -and $global:mock['refreshCount'] -eq 1) 'Move completes only after source refresh check.'
+        $deleteIndex = $global:mock['requests'].FindIndex([Predicate[object]]{ param($request) $request['method'] -eq 'DELETE' })
+        Assert-True (@($global:mock['requests'] | Select-Object -First $deleteIndex | Where-Object { $_['path'] -match '/refreshes/[^/]+$' }).Count -eq 2) 'Pending and completed refresh polling precedes DELETE.'
+        Assert-True ($global:mock['sourceModels'].ContainsKey($datasetId)) 'Move never deletes the original model.'
+        $null = & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply
+        Assert-True ($global:mock['refreshCount'] -eq 1 -and $global:mock['importCount'] -eq 1 -and $global:mock['deleteCount'] -eq 1) 'Completed Move resume does not import/refresh/delete again.'
+    }
+    Test-Case 'model-refresh-credential-failure' {
+        $global:mock['refreshFailure'] = $true
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'Konfigurasi credentials/koneksi/gateway'
+        Assert-True ($global:mock['deleteCount'] -eq 0 -and $global:mock['sourceReports'].Count -eq 1) 'Failed credentials leave source report intact.'
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'Konfigurasi credentials/gateway'
+        Assert-True ($global:mock['refreshCount'] -eq 1) 'Failed refresh is not blindly retried.'
+    }
+    Test-Case 'model-import-response-lost' {
+        $global:mock['importResponseLost'] = $true
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Apply } 'import response lost'
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Apply } 'ImportRequested.*tinjauan manual'
+        Assert-True ($global:mock['importCount'] -eq 1 -and $global:mock['postCount'] -eq 0) 'Unknown import outcome cannot duplicate model or clone report.'
+    }
+    Test-Case 'model-import-failed' {
+        $global:mock['importFailure'] = $true
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'Import model.*gagal'
+        Assert-True ($global:mock['postCount'] -eq 0 -and $global:mock['deleteCount'] -eq 0) 'Failed import prevents report mutation.'
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Apply } 'ImportFailed.*tinjauan manual'
+        Assert-True ($global:mock['importCount'] -eq 1) 'Import failure needs manual review, not another POST.'
+    }
+    Test-Case 'model-import-resume-pending-id' {
+        $global:mock['pendingImportPolls'] = 180
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Apply } 'Import masih berjalan'
+        Assert-True ($global:mock['importCount'] -eq 1 -and $global:mock['postCount'] -eq 0) 'Timeout preserves import journal.'
+        $null = & $migrationScript @parameters -IncludeSemanticModels -Apply
+        Assert-True ($global:mock['importCount'] -eq 1 -and $global:mock['postCount'] -eq 1) 'Resume polls the recorded import, not another POST.'
+    }
+    foreach ($mismatch in @('Sources', 'Parameters')) {
+        Test-Case "model-imported-$mismatch-mismatch" {
+            $global:mock["imported${mismatch}Mismatch"] = $true
+            Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'Referensi sources/parameter.*berbeda'
+            Assert-True ($global:mock['postCount'] -eq 0 -and $global:mock['deleteCount'] -eq 0) 'Source or parameter drift prevents report mutation.'
+        }
+    }
+    Test-Case 'model-name-conflict' {
+        $global:mock['targetModels'] += @{ id = $secondReportId; name = 'Sales Model' }
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Apply } 'Nama model.*konflik'
+        Assert-True ($global:mock['exportCount'] -eq 0 -and $global:mock['importCount'] -eq 0) 'Untracked model conflict blocks all writes.'
+    }
+    Test-Case 'model-liveconnect-unsupported' {
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -BackupDownloadType LiveConnect -Apply } 'membutuhkan.*IncludeModel'
+        Assert-True ($global:mock['requests'].Count -eq 0) 'Model transfer cannot silently use a report-only PBIX.'
+    }
+    Test-Case 'model-nonrefreshable-unsupported' {
+        $global:mock['sourceModels'][$datasetId]['isRefreshable'] = $false
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Apply } 'hanya mendukung model Import'
+        Assert-True ($global:mock['exportCount'] -eq 0 -and $global:mock['importCount'] -eq 0) 'Unsupported model is blocked in preflight.'
+    }
+    Test-Case 'model-switch-scope-not-implicit-rebind' {
+        $null = & $migrationScript @parameters -Apply
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Apply } 'Cakupan model berbeda'
+        Assert-True ($global:mock['importCount'] -eq 0 -and $global:mock['postCount'] -eq 1) 'Report-only migration is not silently rebound.'
+    }
+    Test-Case 'model-scope-required-on-resume' {
+        $null = & $migrationScript @parameters -IncludeSemanticModels -Apply
+        Assert-Throws { & $migrationScript @parameters -Mode Move -Apply } 'Cakupan model berbeda'
+        Assert-True ($global:mock['deleteCount'] -eq 0) 'Dropping model option cannot bypass target model checks.'
+    }
+    Test-Case 'model-refresh-response-lost' {
+        $global:mock['refreshResponseLost'] = $true
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'refresh response lost'
+        $global:mock['refreshResponseLost'] = $false
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'Requested.*Konfigurasi'
+        Assert-True ($global:mock['refreshCount'] -eq 1 -and $global:mock['deleteCount'] -eq 0) 'Unknown refresh request cannot be replayed.'
+    }
+    Test-Case 'model-source-config-changed-on-resume' {
+        $null = & $migrationScript @parameters -IncludeSemanticModels -Apply
+        $global:mock['modelParameters'][$datasetId][0]['currentValue'] = 'another.example.test'
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Apply } 'referensi sources/parameter model asal berubah'
+        Assert-True ($global:mock['importCount'] -eq 1 -and $global:mock['postCount'] -eq 1) 'Source config drift does not produce a success fallback.'
+    }
+    Test-Case 'model-backup-missing-datamodel' {
+        $global:mock['exportBytes'] = New-ArchiveFixture -OmitDataModel
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Apply } 'tidak memiliki DataModel'
+        Assert-True ($global:mock['importCount'] -eq 0 -and $global:mock['postCount'] -eq 0) 'Report-only backup cannot authorize a model import.'
+    }
+    Test-Case 'model-data-snapshot-changed-on-resume' {
+        $null = & $migrationScript @parameters -IncludeSemanticModels -Apply
+        $global:mock['exportBytes'] = New-ArchiveFixture -ModelContent 'changed model content'
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'Snapshot DataModel sumber berubah'
+        Assert-True ($global:mock['importCount'] -eq 1 -and $global:mock['deleteCount'] -eq 0) 'Stale model cannot authorize Move after source content changes.'
+    }
+    Test-Case 'model-refresh-pending-resume' {
+        $global:mock['pendingRefreshPolls'] = 180
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'Refresh masih berjalan'
+        Assert-True ($global:mock['deleteCount'] -eq 0) 'Pending refresh cannot authorize source deletion.'
+        $null = & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply
+        Assert-True ($global:mock['refreshCount'] -eq 1 -and $global:mock['deleteCount'] -eq 1) 'Resume polls the existing refresh without POST replay.'
+    }
+    Test-Case 'model-malformed-refresh-location' {
+        $global:mock['onRequest'] = {
+            param($method, $path, $outFile)
+            if ($method -eq 'POST' -and $path -match '/refreshes$') {
+                Set-ResponseSequence -Method POST -Path $path -Responses @(
+                    (New-MockResponse -Status 202 -Headers @{ Location = @('https://unrelated.example.test/refresh') })
+                )
+            }
+        }
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'Location/ID yang valid'
+        Assert-True ($global:mock['deleteCount'] -eq 0) 'Untrusted refresh location is not followed and cannot authorize DELETE.'
+    }
+    Test-Case 'model-refresh-request-id-without-location' {
+        $global:mock['onRequest'] = {
+            param($method, $path, $outFile)
+            if ($method -eq 'POST' -and $path -match '/refreshes$') {
+                Set-ResponseSequence -Method POST -Path $path -Responses @(
+                    (New-MockResponse -Status 202 -Headers @{ 'x-ms-request-id' = @([guid]::NewGuid().ToString()) })
+                )
+            }
+        }
+        $result = @(& $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply)
+        Assert-True ($result[0].status -eq 'SourceDeleted') 'Documented request ID tracks refresh when Location is missing.'
+    }
+    Test-Case 'model-refresh-no-tracking-headers' {
+        $global:mock['onRequest'] = {
+            param($method, $path, $outFile)
+            if ($method -eq 'POST' -and $path -match '/refreshes$') {
+                Set-ResponseSequence -Method POST -Path $path -Responses @(
+                    (New-MockResponse -Status 202)
+                )
+            }
+        }
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'Location/ID yang valid'
+        Assert-True ($global:mock['deleteCount'] -eq 0) 'Missing headers produce an explicit safety error, not null-method failure.'
+    }
+    Test-Case 'model-regional-refresh-location' {
+        $global:mock['onRequest'] = {
+            param($method, $path, $outFile)
+            if ($method -eq 'POST' -and $path -match '/refreshes$') {
+                $id = [guid]::NewGuid().ToString()
+                Set-ResponseSequence -Method POST -Path $path -Responses @(
+                    (New-MockResponse -Status 202 -Headers @{
+                        Location = @("https://wabi-west-us3-a-primary-redirect.analysis.windows.net/v1.0/myorg/$path/$id")
+                        'x-ms-request-id' = @($id)
+                    })
+                )
+            }
+        }
+        $result = @(& $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply)
+        Assert-True ($result[0].status -eq 'SourceDeleted') 'Regional Power BI Location is validated, then polling stays on the canonical API endpoint.'
+    }
+    Test-Case 'model-refresh-conflicting-header-ids' {
+        $global:mock['onRequest'] = {
+            param($method, $path, $outFile)
+            if ($method -eq 'POST' -and $path -match '/refreshes$') {
+                Set-ResponseSequence -Method POST -Path $path -Responses @(
+                    (New-MockResponse -Status 202 -Headers @{
+                        Location = @("https://api.powerbi.com/v1.0/myorg/$path/$([guid]::NewGuid().ToString())")
+                        'x-ms-request-id' = @([guid]::NewGuid().ToString())
+                    })
+                )
+            }
+        }
+        Assert-Throws { & $migrationScript @parameters -IncludeSemanticModels -Mode Move -Apply } 'x-ms-request-id.*berbeda'
+        Assert-True ($global:mock['deleteCount'] -eq 0) 'Inconsistent operation IDs cannot authorize source deletion.'
     }
     if ($failures.Count -gt 0) {
         throw "$($failures.Count) of $testCount unit tests failed:`n$($failures -join "`n")"

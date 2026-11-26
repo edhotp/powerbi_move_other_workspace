@@ -6,6 +6,8 @@ Copies or moves Power BI reports between workspaces on the same capacity.
 Read-only preview by default. Use -Apply to execute. Copy retains source
 reports; Move deletes them only after all selected targets are verified.
 Both modes retain original semantic models and never change capacity.
+IncludeSemanticModels imports related models into the target and keeps their
+original data source references. Move then requires target source validation.
 All selected reports must have verified local PBIX backups before mutation.
 Uses interactive user login through MicrosoftPowerBIMgmt.Profile 1.3.84+.
 #>
@@ -25,6 +27,8 @@ param(
     [string]$Mode = 'Copy',
 
     [switch]$Apply,
+
+    [switch]$IncludeSemanticModels,
 
     [ValidateNotNullOrEmpty()]
     [string]$BackupDirectory = (Join-Path $PSScriptRoot 'Backups'),
@@ -55,7 +59,10 @@ function Invoke-PowerBIApi {
         [string]$Path,
         [System.Collections.IDictionary]$Body,
         [switch]$AllowNotFound,
-        [string]$OutFile
+        [string]$OutFile,
+        [System.Collections.IDictionary]$Form,
+        [switch]$AllowAccepted,
+        [switch]$RawResponse
     )
     for ($attempt = 0; $attempt -le 3; $attempt++) {
         $request = @{
@@ -70,6 +77,10 @@ function Invoke-PowerBIApi {
             $request['ContentType'] = 'application/json; charset=utf-8'
             $request['Body'] = [Text.Encoding]::UTF8.GetBytes(($Body | ConvertTo-Json -Depth 20 -Compress))
         }
+        if ($null -ne $Form) {
+            $request['Form'] = $Form
+            $request['TimeoutSec'] = 1800
+        }
         if (-not [string]::IsNullOrWhiteSpace($OutFile)) {
             $request['OutFile'] = $OutFile
             $request['PassThru'] = $true
@@ -78,7 +89,8 @@ function Invoke-PowerBIApi {
         # A lost POST response may still have created a report. Never replay it.
         $response = Invoke-WebRequest @request
         $status = [int]$response.StatusCode
-        if ($status -eq 200) {
+        if ($status -eq 200 -or ($AllowAccepted -and $status -eq 202)) {
+            if ($RawResponse) { return $response }
             if ($Method -eq 'DELETE') { return }
             if (-not [string]::IsNullOrWhiteSpace($OutFile)) { return $response }
             $result = $response.Content | ConvertFrom-Json -AsHashtable
@@ -249,10 +261,208 @@ function Assert-ReportBinding {
     }
 }
 
+function Get-ModelSourceSnapshot {
+    param([string]$WorkspaceId, [string]$ModelId)
+    $sources = Invoke-PowerBIApi -Method GET -Path "groups/$WorkspaceId/datasets/$ModelId/datasources"
+    $parameters = Invoke-PowerBIApi -Method GET -Path "groups/$WorkspaceId/datasets/$ModelId/parameters"
+    if ($sources['value'] -isnot [array] -or $parameters['value'] -isnot [array]) {
+        throw 'Respons datasources/parameters model tidak valid: value harus array.'
+    }
+    $sourceKeys = @(
+        foreach ($dataSource in $sources['value']) {
+            if ($dataSource -isnot [System.Collections.IDictionary] -or
+                [string]::IsNullOrWhiteSpace($dataSource['datasourceType']) -or
+                $dataSource['connectionDetails'] -isnot [System.Collections.IDictionary]) {
+                throw 'Referensi data source model tidak lengkap; migrasi tidak dilanjutkan.'
+            }
+            $details = [ordered]@{}
+            foreach ($key in $dataSource['connectionDetails'].Keys | Sort-Object -CaseSensitive) {
+                if ($null -ne $dataSource['connectionDetails'][$key] -and $dataSource['connectionDetails'][$key] -isnot [string]) {
+                    throw 'Format connectionDetails data source tidak didukung.'
+                }
+                $details[$key] = $dataSource['connectionDetails'][$key]
+            }
+            [ordered]@{ datasourceType = $dataSource['datasourceType']; connectionDetails = $details } |
+                ConvertTo-Json -Depth 20 -Compress
+        }
+    )
+    $parameterKeys = @(
+        foreach ($parameter in $parameters['value']) {
+            if ($parameter -isnot [System.Collections.IDictionary] -or
+                [string]::IsNullOrWhiteSpace($parameter['name']) -or
+                [string]::IsNullOrWhiteSpace($parameter['type']) -or -not $parameter.ContainsKey('currentValue')) {
+                throw 'Referensi parameter model tidak lengkap; migrasi tidak dilanjutkan.'
+            }
+            [ordered]@{
+                name = $parameter['name']; type = $parameter['type']
+                currentValue = $parameter['currentValue']; isRequired = $parameter['isRequired']
+            } | ConvertTo-Json -Depth 20 -Compress
+        }
+    )
+    $canonical = [ordered]@{
+        sources = @($sourceKeys | Sort-Object -CaseSensitive)
+        parameters = @($parameterKeys | Sort-Object -CaseSensitive)
+    } | ConvertTo-Json -Depth 20 -Compress
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        # Persist only a fingerprint; parameter values may contain sensitive data.
+        $signature = [BitConverter]::ToString($sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))).Replace('-', '')
+    } finally { $sha256.Dispose() }
+    return @{ signature = $signature; sourceCount = $sourceKeys.Count }
+}
+
+function Assert-ModelSources {
+    param([System.Collections.IDictionary]$Model)
+    $targetModel = Invoke-PowerBIApi -Method GET -Path "groups/$($target['id'])/datasets/$($Model['targetDatasetId'])"
+    if ($targetModel['id'] -ne $Model['targetDatasetId'] -or $targetModel['name'] -cne $Model['name']) {
+        throw "Model tujuan '$($Model['name'])' tidak cocok dengan state."
+    }
+    $snapshot = Get-ModelSourceSnapshot -WorkspaceId $target['id'] -ModelId $Model['targetDatasetId']
+    if ($snapshot['signature'] -cne $Model['sourceSignature']) {
+        throw "Referensi sources/parameter model '$($Model['name'])' berbeda. Periksa koneksi; sumber tidak dihapus."
+    }
+}
+
+function Get-ModelBackupSignature {
+    param([System.Collections.IDictionary]$Backup)
+    if ((Get-Item -LiteralPath $Backup['path']).Length -ge 1GB) {
+        throw 'Import model PBIX >= 1 GB memerlukan jalur temporary upload terpisah; sumber tidak diubah.'
+    }
+    $archive = [IO.Compression.ZipFile]::OpenRead($Backup['path'])
+    try {
+        $dataModel = $archive.GetEntry('DataModel')
+        if ($null -eq $dataModel -or $dataModel.Length -eq 0) {
+            throw "Backup '$($Backup['name'])' tidak memiliki DataModel. LiveConnect/Direct Lake tidak didukung migrasi model ini."
+        }
+        $stream = $dataModel.Open()
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            return [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '')
+        } finally { $sha256.Dispose(); $stream.Dispose() }
+    } finally { $archive.Dispose() }
+}
+
+function Complete-ModelImport {
+    param([string]$ModelId, [string]$BackupReportId)
+    $model = $state['models'][$ModelId]
+    if ($model['status'] -eq 'Planned') {
+        $backup = $state['backups'][$BackupReportId]
+        $model['status'] = 'ImportRequested'
+        Save-MigrationState
+        $displayName = [uri]::EscapeDataString($model['name'] + '.pbix')
+        $created = Invoke-PowerBIApi -Method POST -Path "groups/$($target['id'])/imports?datasetDisplayName=$displayName&nameConflict=Abort&skipReport=true" -Form @{
+            file = Get-Item -LiteralPath $backup['path']
+        } -AllowAccepted
+        $importId = [guid]::Empty
+        if (-not [guid]::TryParse([string]$created['id'], [ref]$importId) -or $importId -eq [guid]::Empty) {
+            throw "Import '$($model['name'])' tidak memiliki ID valid; jangan ulang POST."
+        }
+        $model['importId'] = $importId.ToString()
+        $model['status'] = 'Importing'
+        Save-MigrationState
+    }
+    if ($model['status'] -eq 'Importing') {
+        for ($poll = 0; $poll -lt 180; $poll++) {
+            $operation = Invoke-PowerBIApi -Method GET -Path "groups/$($target['id'])/imports/$($model['importId'])"
+            if ($operation['id'] -ne $model['importId']) { throw 'ID operasi import berbeda dari state.' }
+            if ($operation['importState'] -eq 'Failed') {
+                $model['status'] = 'ImportFailed'
+                Save-MigrationState
+                throw "Import model '$($model['name'])' gagal. Periksa operasi import yang tercatat; POST tidak diulang."
+            }
+            if ($operation['importState'] -eq 'Succeeded') {
+                if ($operation['datasets'] -isnot [array] -or $operation['datasets'].Count -ne 1 -or
+                    $operation['datasets'][0]['name'] -cne $model['name'] -or
+                    $operation['reports'] -isnot [array] -or $operation['reports'].Count -ne 0) {
+                    throw 'Import model tidak mengembalikan tepat satu model tanpa report.'
+                }
+                $targetId = [guid]::Empty
+                if (-not [guid]::TryParse([string]$operation['datasets'][0]['id'], [ref]$targetId) -or
+                    $targetId -eq [guid]::Empty -or $targetId.ToString() -eq $ModelId) {
+                    throw 'ID model tujuan tidak valid atau sama dengan model asal.'
+                }
+                $model['targetDatasetId'] = $targetId.ToString()
+                $model['status'] = 'Imported'
+                Save-MigrationState
+                break
+            }
+            if ($operation['importState'] -notin @('Publishing', 'NotStarted')) { throw 'Status import tidak dikenal.' }
+            if ($poll -lt 179) { Start-Sleep -Seconds 10 }
+        }
+        if ($model['status'] -eq 'Importing') { throw 'Import masih berjalan. Jalankan ulang dengan state yang sama untuk polling, bukan POST baru.' }
+    }
+    Assert-ModelSources -Model $model
+    $model['status'] = 'SourcesVerified'
+    Save-MigrationState
+}
+
+function Confirm-ModelRefresh {
+    param([System.Collections.IDictionary]$Model)
+    if ($Model['sourceCount'] -eq 0) { return }
+    if (-not $Model.ContainsKey('refreshStatus') -or $Model['refreshStatus'] -eq 'Completed') {
+        $Model['refreshStatus'] = 'Requested'
+        $Model.Remove('refreshId')
+        Save-MigrationState
+        $path = "groups/$($target['id'])/datasets/$($Model['targetDatasetId'])/refreshes"
+        $accepted = Invoke-PowerBIApi -Method POST -Path $path -Body @{ notifyOption = 'NoNotification' } -AllowAccepted -RawResponse
+        $location = [string]($accepted.Headers['Location'] | Select-Object -First 1)
+        $refreshId = [guid]::Empty
+        if (-not [string]::IsNullOrWhiteSpace($location)) {
+            $locationUri = $null
+            $expectedPath = ([uri]"$apiRoot/$path/").AbsolutePath
+            if (-not [uri]::TryCreate($location, [UriKind]::Absolute, [ref]$locationUri) -or
+                $locationUri.Scheme -ne 'https' -or -not $locationUri.IsDefaultPort -or
+                $locationUri.UserInfo -ne '' -or $locationUri.Query -ne '' -or $locationUri.Fragment -ne '' -or
+                ($locationUri.Host -ne 'api.powerbi.com' -and $locationUri.Host -notmatch '^wabi-[a-z0-9-]+\.analysis\.windows\.net$') -or
+                -not $locationUri.AbsolutePath.StartsWith($expectedPath, [StringComparison]::OrdinalIgnoreCase) -or
+                -not [guid]::TryParse($locationUri.AbsolutePath.Substring($expectedPath.Length), [ref]$refreshId)) {
+                throw 'Refresh diterima tanpa Location/ID yang valid. Periksa operasi target; jangan ulang POST.'
+            }
+        }
+        $requestId = [string]($accepted.Headers['x-ms-request-id'] | Select-Object -First 1)
+        $requestGuid = [guid]::Empty
+        if (-not [string]::IsNullOrWhiteSpace($requestId)) {
+            if (-not [guid]::TryParse($requestId, [ref]$requestGuid) -or $requestGuid -eq [guid]::Empty -or
+                ($refreshId -ne [guid]::Empty -and $refreshId -ne $requestGuid)) {
+                throw 'ID refresh Location dan x-ms-request-id tidak valid atau berbeda. Periksa operasi target; jangan ulang POST.'
+            }
+            $refreshId = $requestGuid
+        }
+        if ($refreshId -eq [guid]::Empty) {
+            throw 'Refresh diterima tanpa Location/ID yang valid. Periksa operasi target; jangan ulang POST.'
+        }
+        $Model['refreshId'] = $refreshId.ToString()
+        $Model['refreshStatus'] = 'Running'
+        Save-MigrationState
+    }
+    if ($Model['refreshStatus'] -ne 'Running') {
+        throw "Refresh '$($Model['name'])' berstatus $($Model['refreshStatus']). Konfigurasi credentials/gateway di Service dan tinjau state sebelum mencoba ulang."
+    }
+    for ($poll = 0; $poll -lt 180; $poll++) {
+        $refresh = Invoke-PowerBIApi -Method GET -Path "groups/$($target['id'])/datasets/$($Model['targetDatasetId'])/refreshes/$($Model['refreshId'])" -AllowAccepted
+        if ($refresh['status'] -eq 'Completed') {
+            $Model['refreshStatus'] = 'Completed'
+            Save-MigrationState
+            return
+        }
+        if ($refresh['status'] -in @('Failed', 'Cancelled', 'Disabled')) {
+            $Model['refreshStatus'] = $refresh['status']
+            Save-MigrationState
+            throw "Refresh model '$($Model['name'])' gagal. Konfigurasi credentials/koneksi/gateway di Power BI Service. Report asal tidak dihapus."
+        }
+        if ($refresh['status'] -notin @('Unknown', 'NotStarted', 'InProgress')) { throw 'Status refresh tidak dikenal.' }
+        if ($poll -lt 179) { Start-Sleep -Seconds 10 }
+    }
+    throw 'Refresh masih berjalan; lanjutkan polling melalui state yang sama. Penghapusan sumber tidak dijalankan.'
+}
+
 $resolvedStatePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($StatePath)
 $resolvedBackupDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BackupDirectory)
 $lock = $null
 try {
+    if ($IncludeSemanticModels -and $BackupDownloadType -ne 'IncludeModel') {
+        throw '-IncludeSemanticModels membutuhkan -BackupDownloadType IncludeModel.'
+    }
     if ($Apply) {
         $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($resolvedStatePath))
         # Keep this file so concurrent processes always lock the same file.
@@ -309,6 +519,8 @@ try {
     if ($state['backups'] -isnot [System.Collections.IDictionary]) {
         throw 'Format backups dalam state tidak valid.'
     }
+    if (-not $state.ContainsKey('models')) { $state['models'] = @{} }
+    if ($state['models'] -isnot [System.Collections.IDictionary]) { throw 'Format models dalam state tidak valid.' }
 
     $sourceResponse = Invoke-PowerBIApi -Method GET -Path "groups/$($source['id'])/reports"
     $targetResponse = Invoke-PowerBIApi -Method GET -Path "groups/$($target['id'])/reports"
@@ -356,6 +568,10 @@ try {
             $action = 'Clone'
             if ($state['reports'].ContainsKey($reportId)) {
                 $record = $state['reports'][$reportId]
+                $hasTargetModel = $record.ContainsKey('targetDatasetId') -and $record['targetDatasetId'] -ne $record['datasetId']
+                if ([bool]$hasTargetModel -ne [bool]$IncludeSemanticModels) {
+                    throw 'Cakupan model berbeda dari state report. Gunakan StatePath baru atau lanjutkan opsi IncludeSemanticModels yang sama; script tidak rebind hasil lama otomatis.'
+                }
                 if ($record['name'] -cne $report['name'] -or $record['datasetId'] -ne $report['datasetId']) {
                     throw "Report asal '$($report['name'])' berubah sejak pencatatan state. Tinjau manual."
                 }
@@ -374,7 +590,8 @@ try {
                 if ($existing.Count -ne 1 -or $existing[0]['id'] -ne $record['targetReportId']) {
                     throw "Report tujuan '$($report['name'])' hilang atau konflik dengan state. Tinjau manual."
                 }
-                Assert-ReportBinding -Report $existing[0] -ExpectedId $record['targetReportId'] -ExpectedName $record['name'] -ExpectedDataset $record['datasetId']
+                $expectedModel = if ($hasTargetModel) { $record['targetDatasetId'] } else { $record['datasetId'] }
+                Assert-ReportBinding -Report $existing[0] -ExpectedId $record['targetReportId'] -ExpectedName $record['name'] -ExpectedDataset $expectedModel
                 $action = 'VerifyExisting'
             } elseif ($existing.Count -gt 0) {
                 throw "Nama '$($report['name'])' sudah ada di tujuan tetapi tidak tercatat di state. Script tidak menimpa atau menganggapnya hasil migrasi."
@@ -389,6 +606,41 @@ try {
             }
         }
     )
+    $modelIds = @($plan | ForEach-Object { $_['datasetId'] } | Select-Object -Unique)
+    if ($IncludeSemanticModels) {
+        $modelResponse = Invoke-PowerBIApi -Method GET -Path "groups/$($target['id'])/datasets"
+        $targetModels = @(Get-PowerBICollection -Response $modelResponse -Label 'model')
+        foreach ($modelId in $modelIds) {
+            $sourceModel = Invoke-PowerBIApi -Method GET -Path "groups/$($source['id'])/datasets/$modelId"
+            if ($sourceModel['id'] -ne $modelId -or [string]::IsNullOrWhiteSpace($sourceModel['name']) -or $sourceModel['isRefreshable'] -ne $true) {
+                throw 'Migrasi model ini hanya mendukung model Import refreshable di workspace source. DirectQuery/Direct Lake/model eksternal memerlukan jalur terpisah.'
+            }
+            $snapshot = Get-ModelSourceSnapshot -WorkspaceId $source['id'] -ModelId $modelId
+            if ($state['models'].ContainsKey($modelId)) {
+                $model = $state['models'][$modelId]
+                if ($model['name'] -cne $sourceModel['name'] -or $model['sourceSignature'] -cne $snapshot['signature']) {
+                    throw 'Nama atau referensi sources/parameter model asal berubah sejak state dibuat.'
+                }
+                if ($model['status'] -notin @('Planned', 'Importing', 'Imported', 'SourcesVerified')) {
+                    throw "Status model $($model['status']) membutuhkan tinjauan manual; jangan ulang POST import."
+                }
+            } else {
+                $model = @{
+                    name = $sourceModel['name']; sourceSignature = $snapshot['signature']
+                    sourceCount = $snapshot['sourceCount']; status = 'Planned'; targetDatasetId = $null
+                }
+                $state['models'][$modelId] = $model
+            }
+            $conflicts = @($targetModels | Where-Object { $_['name'] -eq $model['name'] })
+            if ($conflicts.Count -gt 0 -and ($model['status'] -ne 'Importing') -and
+                ($conflicts.Count -ne 1 -or $conflicts[0]['id'] -ne $model['targetDatasetId'])) {
+                throw "Nama model '$($model['name'])' konflik di tujuan; model tidak ditimpa/adopsi otomatis."
+            }
+        }
+        if (@($modelIds | ForEach-Object { [pscustomobject]$state['models'][$_] } | Group-Object name | Where-Object Count -gt 1).Count -gt 0) {
+            throw 'Model asal terpilih memiliki nama yang sama; pilih laporan dengan model bernama unik.'
+        }
+    }
     Write-Host "Asal: $($source['name']) [$($source['id'])]"
     Write-Host "Tujuan: $($target['name']) [$($target['id'])]"
     Write-Host "Capacity sama: $($source['capacityId'])"
@@ -397,7 +649,11 @@ try {
     if ($BackupDownloadType -eq 'LiveConnect') {
         Write-Warning 'Backup LiveConnect tidak berisi data/model offline. Pemulihan masih membutuhkan semantic model online dan akses pengguna.'
     }
-    Write-Warning 'Semantic model tetap di lokasi asal. Jangan hapus workspace/model asal; akses pengguna ke model tetap diperlukan.'
+    if ($IncludeSemanticModels) {
+        Write-Warning 'Semantic model terkait akan disalin dan report tujuan terikat ke model baru. Sumber data fisik, credentials, gateway binding dan model asal tidak dihapus/dipindahkan. Move mensyaratkan refresh sumber target berhasil.'
+    } else {
+        Write-Warning 'Semantic model tetap di lokasi asal. Jangan hapus workspace/model asal; akses pengguna ke model tetap diperlukan.'
+    }
     if ($Mode -eq 'Move') {
         Write-Warning 'MOVE akan menghapus report asal setelah semua tujuan lolos verifikasi API. URL/sharing/app lama dapat terputus; verifikasi API bukan uji visual/RLS.'
     }
@@ -437,6 +693,22 @@ try {
     foreach ($item in $plan) {
         Assert-LocalBackup -Backup $state['backups'][$item['sourceReportId']] -Item $item
     }
+    if ($IncludeSemanticModels) {
+        foreach ($modelId in $modelIds) {
+            $backupItem = @($plan | Where-Object { $_['datasetId'] -eq $modelId })[0]
+            $signature = Get-ModelBackupSignature -Backup $state['backups'][$backupItem['sourceReportId']]
+            $model = $state['models'][$modelId]
+            if ($model.ContainsKey('sourceDataModelSignature') -and $model['sourceDataModelSignature'] -cne $signature) {
+                throw 'Snapshot DataModel sumber berubah sejak migrasi model. Tinjau model tujuan; jangan memakai model lama untuk report yang berubah.'
+            }
+            $model['sourceDataModelSignature'] = $signature
+        }
+        Save-MigrationState
+        foreach ($modelId in $modelIds) {
+            $backupItem = @($plan | Where-Object { $_['datasetId'] -eq $modelId })[0]
+            Complete-ModelImport -ModelId $modelId -BackupReportId $backupItem['sourceReportId']
+        }
+    }
 
     foreach ($item in $plan) {
         $reportId = $item['sourceReportId']
@@ -448,11 +720,16 @@ try {
                 status = 'CloneRequested'
                 updatedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
             }
+            if ($IncludeSemanticModels) {
+                $state['reports'][$reportId]['targetDatasetId'] = $state['models'][$item['datasetId']]['targetDatasetId']
+            }
             Save-MigrationState
-            $created = Invoke-PowerBIApi -Method POST -Path "groups/$($source['id'])/reports/$reportId/Clone" -Body @{
+            $cloneBody = @{
                 name = $item['name']
                 targetWorkspaceId = $target['id']
             }
+            if ($IncludeSemanticModels) { $cloneBody['targetModelId'] = $state['reports'][$reportId]['targetDatasetId'] }
+            $created = Invoke-PowerBIApi -Method POST -Path "groups/$($source['id'])/reports/$reportId/Clone" -Body $cloneBody
             $createdId = [guid]::Empty
             if (-not [guid]::TryParse([string]$created['id'], [ref]$createdId) -or $createdId -eq [guid]::Empty) {
                 throw "Clone '$($item['name'])' tidak mengembalikan ID valid. Cek tujuan; jangan ulang POST."
@@ -463,7 +740,8 @@ try {
         }
         $record = $state['reports'][$reportId]
         $verified = Invoke-PowerBIApi -Method GET -Path "groups/$($target['id'])/reports/$($record['targetReportId'])"
-        Assert-ReportBinding -Report $verified -ExpectedId $record['targetReportId'] -ExpectedName $record['name'] -ExpectedDataset $record['datasetId']
+        $expectedModel = if ($IncludeSemanticModels) { $record['targetDatasetId'] } else { $record['datasetId'] }
+        Assert-ReportBinding -Report $verified -ExpectedId $record['targetReportId'] -ExpectedName $record['name'] -ExpectedDataset $expectedModel
         if ($record['status'] -notin @('DeleteRequested', 'SourceDeleted')) {
             $record['status'] = 'Verified'
         }
@@ -473,6 +751,14 @@ try {
         Write-Host "Verified: $($record['name']) [$($record['targetReportId'])]"
     }
     if ($Mode -eq 'Move') {
+        if ($IncludeSemanticModels) {
+            foreach ($modelId in $modelIds) {
+                Assert-ModelSources -Model $state['models'][$modelId]
+                if (@($plan | Where-Object { $_['datasetId'] -eq $modelId -and $_['sourcePresent'] }).Count -gt 0) {
+                    Confirm-ModelRefresh -Model $state['models'][$modelId]
+                }
+            }
+        }
         # Check every source before the first deletion, not just before its own deletion.
         foreach ($item in $plan) {
             Assert-LocalBackup -Backup $state['backups'][$item['sourceReportId']] -Item $item
